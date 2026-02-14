@@ -1,0 +1,8 @@
+{direction_emoji} <b>{crypto} {timeframe}</b> posible {pattern}
+
+Ventana: {window_label} COL (faltan {seconds_to_end})
+Precio actual: {price_now} (RTDS {live_time})
+Base: {open_price} ({open_source})
+Distancia: {distance} (umbral {threshold})
+
+Max/Min sesion: {max_price} / {min_price}

@@ -1,0 +1,33 @@
+# Secrets and local env files
+.env
+.env.*
+!.env.config
+!.env.example
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime/local data
+state.json
+datos/
+*.sqlite3
+*.db
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
