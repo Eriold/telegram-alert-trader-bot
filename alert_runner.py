@@ -316,6 +316,14 @@ def decorate_preview_payload_for_mode(
             f"Entrada objetivo: {scope_label}. "
             "No ejecuta ordenes reales. Primer clic bloquea el preview."
         )
+    if scope == "current":
+        intent_dir = str(payload.get("intent_direction") or "").strip().upper()
+        live_dir = str(payload.get("live_current_direction") or "").strip().upper()
+        if intent_dir in ("UP", "DOWN"):
+            basis = f"Intencion current basada en racha cerrada: {intent_dir}."
+            if live_dir in ("UP", "DOWN") and live_dir != intent_dir:
+                basis += f" Direccion live actual: {live_dir}."
+            payload["preview_footer"] = f"{payload.get('preview_footer', '')}\n{basis}".strip()
     return payload
 
 
@@ -1691,11 +1699,13 @@ async def command_loop(
                 )
 
                 current_delta: Optional[float] = None
-                current_dir: Optional[str] = None
+                live_current_dir: Optional[str] = None
+                intent_dir: Optional[str] = None
                 pattern_label = "N/D"
+                directions: List[str] = []
                 if open_price is not None and live_price is not None:
                     current_delta = live_price - open_price
-                    current_dir = "UP" if current_delta >= 0 else "DOWN"
+                    live_current_dir = "UP" if current_delta >= 0 else "DOWN"
 
                     directions = fetch_last_closed_directions_excluding_current(
                         preset.db_path,
@@ -1716,15 +1726,20 @@ async def command_loop(
                         if len(api_directions) >= len(directions) and api_directions:
                             directions = api_directions
 
-                    streak_before_current = count_consecutive_directions(
+                if directions:
+                    intent_dir = str(directions[0]).upper()
+                    streak_before_intent = count_consecutive_directions(
                         directions,
-                        current_dir,
+                        intent_dir,
                         max_count=max_pattern_streak,
                     )
-                    pattern_over_limit = streak_before_current >= max_pattern_streak
-                    pattern_count = min(streak_before_current + 1, max_pattern_streak)
+                    pattern_over_limit = streak_before_intent >= max_pattern_streak
+                    pattern_count = min(streak_before_intent + 1, max_pattern_streak)
                     pattern_suffix = "+" if pattern_over_limit else ""
-                    pattern_label = f"{current_dir}{pattern_count}{pattern_suffix}"
+                    pattern_label = f"{intent_dir}{pattern_count}{pattern_suffix}"
+                elif live_current_dir is not None:
+                    intent_dir = live_current_dir
+                    pattern_label = f"{intent_dir}1"
 
                 preview_data = build_preview_payload(
                     preset=preset,
@@ -1732,7 +1747,7 @@ async def command_loop(
                     w_end=w_end,
                     seconds_to_end=seconds_to_end,
                     live_price=live_price,
-                    current_dir=current_dir,
+                    current_dir=intent_dir,
                     current_delta=current_delta,
                     operation_pattern=pattern_label,
                     operation_pattern_trigger=operation_pattern_trigger,
@@ -1745,6 +1760,8 @@ async def command_loop(
                     preset,
                     w_start,
                 )
+                preview_data["intent_direction"] = intent_dir or ""
+                preview_data["live_current_direction"] = live_current_dir or ""
                 preview_data, _ = apply_preview_target_to_context(
                     preview_data,
                     DEFAULT_PREVIEW_TARGET_CODE,
