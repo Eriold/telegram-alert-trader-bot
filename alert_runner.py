@@ -18,19 +18,19 @@ PREVIEW_CALLBACK_SEPARATOR = "|"
 DEFAULT_PREVIEW_TARGET_CODE = "tp80"
 PREVIEW_TARGET_OPTIONS: Dict[str, Dict[str, object]] = {
     "tp70": {
-        "button": "Salir 70%",
+        "button": "🟢 Salir 70%",
         "name": "TP 70%",
         "kind": "pct",
         "value": 70.0,
     },
     "tp80": {
-        "button": "Salir 80%",
+        "button": "🟡 Salir 80%",
         "name": "TP 80%",
         "kind": "pct",
         "value": 80.0,
     },
     "tp99": {
-        "button": "Venc. 0.99",
+        "button": "🔵 Venc. 0.99",
         "name": "Vencimiento 0.99",
         "kind": "price",
         "value": 0.99,
@@ -46,6 +46,8 @@ DEFAULT_EXIT_LIMIT_MAX_RETRIES = 3
 DEFAULT_EXIT_LIMIT_RETRY_SECONDS = 1.0
 DEFAULT_EXIT_ORDER_VERIFY_SECONDS = 4
 EXIT_LIMIT_FAILURE_TAG = "[EXIT_LIMIT_RETRY_FAILED]"
+DEFAULT_ENTRY_TOKEN_RESOLVE_WAIT_SECONDS = 30
+DEFAULT_ENTRY_TOKEN_RESOLVE_POLL_SECONDS = 2.0
 
 
 def resolve_preview_target_code(raw_code: Optional[str]) -> str:
@@ -58,19 +60,21 @@ def resolve_preview_target_code(raw_code: Optional[str]) -> str:
 
 
 def build_preview_reply_markup(preview_id: str) -> Dict[str, object]:
-    row: List[Dict[str, str]] = []
+    rows: List[List[Dict[str, str]]] = []
     for code in ("tp70", "tp80", "tp99"):
         option = PREVIEW_TARGET_OPTIONS[code]
-        row.append(
-            {
-                "text": str(option["button"]),
-                "callback_data": (
-                    f"{PREVIEW_CALLBACK_PREFIX}{preview_id}"
-                    f"{PREVIEW_CALLBACK_SEPARATOR}{code}"
-                ),
-            }
+        rows.append(
+            [
+                {
+                    "text": str(option["button"]),
+                    "callback_data": (
+                        f"{PREVIEW_CALLBACK_PREFIX}{preview_id}"
+                        f"{PREVIEW_CALLBACK_SEPARATOR}{code}"
+                    ),
+                }
+            ]
         )
-    return {"inline_keyboard": [row]}
+    return {"inline_keyboard": rows}
 
 
 def parse_preview_callback_data(callback_data: str) -> Tuple[str, str]:
@@ -622,6 +626,113 @@ def place_exit_limit_order_with_retries(
     )
 
 
+def fetch_market_snapshot_by_slug(slug: str) -> Optional[Dict[str, object]]:
+    slug_clean = str(slug).strip()
+    if not slug_clean:
+        return None
+    try:
+        resp = HTTP.get(f"{GAMMA_BASE}/markets/slug/{slug_clean}", timeout=8)
+        if resp.status_code != 200:
+            return None
+        market = resp.json() or {}
+        up_price, down_price = parse_gamma_up_down_prices(market)
+        up_token_id, down_token_id = parse_gamma_up_down_token_ids(market)
+        return {
+            "slug": slug_clean,
+            "up_price": up_price,
+            "down_price": down_price,
+            "up_token_id": up_token_id,
+            "down_token_id": down_token_id,
+        }
+    except Exception:
+        return None
+
+
+def build_slug_candidates_for_entry(
+    base_slug: str,
+    timeframe_label: str,
+    symbol: str,
+) -> List[str]:
+    slug_clean = str(base_slug).strip()
+    if not slug_clean:
+        return []
+    parts = slug_clean.rsplit("-", 1)
+    tf = str(timeframe_label or "").strip().lower()
+    offsets: List[int] = [0]
+    if tf == "1h":
+        offsets.extend([-900, 900, -1800, 1800, -2700, 2700])
+
+    candidates: List[str] = []
+    seen: Set[str] = set()
+
+    def add_candidate(value: str) -> None:
+        candidate = str(value).strip()
+        if not candidate:
+            return
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    add_candidate(slug_clean)
+    if len(parts) != 2:
+        return candidates
+
+    prefix, raw_epoch = parts
+    epoch = parse_int(raw_epoch)
+    if epoch is None:
+        return candidates
+
+    for offset in offsets:
+        epoch_shifted = epoch + offset
+        add_candidate(f"{prefix}-{epoch_shifted}")
+        if tf == "1h":
+            start_utc = datetime.fromtimestamp(epoch_shifted, tz=timezone.utc)
+            add_candidate(build_hourly_up_or_down_slug(symbol, start_utc))
+    return candidates
+
+
+def resolve_entry_token_from_preview_context(
+    preview_context: Dict[str, object],
+    wait_seconds: int,
+    poll_seconds: float,
+) -> Tuple[str, Optional[float], str]:
+    entry_outcome = str(preview_context.get("entry_outcome") or "").strip().upper()
+    if entry_outcome not in ("UP", "DOWN"):
+        entry_side = str(preview_context.get("entry_side") or "").strip().upper()
+        if entry_side == "YES":
+            entry_outcome = "UP"
+        elif entry_side == "NO":
+            entry_outcome = "DOWN"
+    if entry_outcome not in ("UP", "DOWN"):
+        return "", None, ""
+
+    next_slug = str(preview_context.get("next_slug") or "").strip()
+    timeframe_label = str(preview_context.get("timeframe") or "").strip().lower()
+    symbol = str(preview_context.get("crypto") or "").strip().upper()
+    candidates = build_slug_candidates_for_entry(next_slug, timeframe_label, symbol)
+    if not candidates:
+        return "", None, ""
+
+    deadline = time.monotonic() + max(1, int(wait_seconds))
+    sleep_for = max(0.5, float(poll_seconds))
+    while time.monotonic() <= deadline:
+        for candidate_slug in candidates:
+            snapshot = fetch_market_snapshot_by_slug(candidate_slug)
+            if snapshot is None:
+                continue
+            if entry_outcome == "UP":
+                token_id = str(snapshot.get("up_token_id") or "").strip()
+                entry_price = snapshot.get("up_price")
+            else:
+                token_id = str(snapshot.get("down_token_id") or "").strip()
+                entry_price = snapshot.get("down_price")
+            if token_id:
+                return token_id, parse_float(str(entry_price)), candidate_slug
+        time.sleep(sleep_for)
+    return "", None, ""
+
+
 def build_live_urgent_exit_limit_failure_message(
     preview_context: Dict[str, object],
     error_detail: str,
@@ -742,11 +853,33 @@ def execute_live_trade_from_preview(
     wallet_history_url: str,
     exit_limit_max_retries: int,
     exit_limit_retry_seconds: float,
+    entry_token_wait_seconds: int,
+    entry_token_poll_seconds: float,
 ) -> Dict[str, object]:
     context, option_name = apply_preview_target_to_context(preview_context, target_code)
     entry_token_id = str(context.get("entry_token_id", "")).strip()
     if not entry_token_id:
-        raise RuntimeError("No se encontro token_id de entrada para la proxima vela.")
+        resolved_token_id, resolved_entry_price, resolved_slug = resolve_entry_token_from_preview_context(
+            context,
+            wait_seconds=entry_token_wait_seconds,
+            poll_seconds=entry_token_poll_seconds,
+        )
+        if resolved_token_id:
+            entry_token_id = resolved_token_id
+            context["entry_token_id"] = entry_token_id
+            if resolved_slug:
+                context["next_slug"] = resolved_slug
+            if resolved_entry_price is not None and resolved_entry_price > 0:
+                context["entry_price_value"] = resolved_entry_price
+                context["entry_price"] = format_optional_decimal(resolved_entry_price, decimals=3)
+                context["entry_price_source"] = f"gamma:{resolved_slug or context.get('next_slug', '')}"
+                context, option_name = apply_preview_target_to_context(context, target_code)
+        else:
+            raise RuntimeError(
+                "No se encontro token_id de entrada para la proxima vela. "
+                "El mercado objetivo aun no esta disponible en Gamma/CLOB; "
+                "reintenta en unos segundos o ejecuta manual."
+            )
 
     shares = parse_int(str(context.get("shares_value")))
     if shares is None:
@@ -978,6 +1111,12 @@ async def command_loop(
     exit_limit_retry_seconds = float(
         trading_runtime.get("exit_limit_retry_seconds") or DEFAULT_EXIT_LIMIT_RETRY_SECONDS
     )
+    entry_token_wait_seconds = int(
+        trading_runtime.get("entry_token_wait_seconds") or DEFAULT_ENTRY_TOKEN_RESOLVE_WAIT_SECONDS
+    )
+    entry_token_poll_seconds = float(
+        trading_runtime.get("entry_token_poll_seconds") or DEFAULT_ENTRY_TOKEN_RESOLVE_POLL_SECONDS
+    )
     wallet_address = str(trading_runtime.get("wallet_address") or "")
     wallet_history_url = str(trading_runtime.get("wallet_history_url") or "")
     trades_state_path = str(trading_runtime.get("trades_state_path") or LIVE_TRADES_STATE_PATH)
@@ -1085,6 +1224,8 @@ async def command_loop(
                                 wallet_history_url,
                                 exit_limit_max_retries,
                                 exit_limit_retry_seconds,
+                                entry_token_wait_seconds,
+                                entry_token_poll_seconds,
                             )
                         except Exception as exc:
                             error_text = str(exc)
@@ -1480,6 +1621,14 @@ async def alert_loop():
     if exit_limit_retry_seconds is None:
         exit_limit_retry_seconds = DEFAULT_EXIT_LIMIT_RETRY_SECONDS
     exit_limit_retry_seconds = max(0.2, exit_limit_retry_seconds)
+    entry_token_wait_seconds = parse_int(env.get("ENTRY_TOKEN_RESOLVE_WAIT_SECONDS"))
+    if entry_token_wait_seconds is None:
+        entry_token_wait_seconds = DEFAULT_ENTRY_TOKEN_RESOLVE_WAIT_SECONDS
+    entry_token_wait_seconds = max(1, entry_token_wait_seconds)
+    entry_token_poll_seconds = parse_float(env.get("ENTRY_TOKEN_RESOLVE_POLL_SECONDS"))
+    if entry_token_poll_seconds is None:
+        entry_token_poll_seconds = DEFAULT_ENTRY_TOKEN_RESOLVE_POLL_SECONDS
+    entry_token_poll_seconds = max(0.5, entry_token_poll_seconds)
     rtds_use_proxy = parse_bool(env.get("RTDS_USE_PROXY"), default=True)
     proxy_url = env.get("PROXY_URL", "").strip()
 
@@ -1525,6 +1674,11 @@ async def alert_loop():
             f"reintentos={exit_limit_max_retries}, "
             f"espera={exit_limit_retry_seconds:.1f}s."
         )
+        print(
+            "Control token entrada: "
+            f"espera_max={entry_token_wait_seconds}s, "
+            f"poll={entry_token_poll_seconds:.1f}s."
+        )
 
     startup_message = env.get("STARTUP_MESSAGE", "").strip()
     if not startup_message:
@@ -1561,6 +1715,8 @@ async def alert_loop():
         "max_usd_per_trade": max_usd_per_trade,
         "exit_limit_max_retries": exit_limit_max_retries,
         "exit_limit_retry_seconds": exit_limit_retry_seconds,
+        "entry_token_wait_seconds": entry_token_wait_seconds,
+        "entry_token_poll_seconds": entry_token_poll_seconds,
         "wallet_address": wallet_address,
         "wallet_history_url": wallet_history_url,
         "trades_state_path": LIVE_TRADES_STATE_PATH,

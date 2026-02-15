@@ -1422,13 +1422,109 @@ def parse_gamma_up_down_token_ids(market: Dict[str, object]) -> Tuple[Optional[s
     return up_token_id, down_token_id
 
 
+def month_name_en_lower(month_index: int) -> str:
+    months = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ]
+    idx = max(1, min(12, month_index)) - 1
+    return months[idx]
+
+
+def nth_weekday_of_month(year: int, month: int, weekday: int, nth: int) -> int:
+    # weekday: Monday=0 ... Sunday=6
+    first = datetime(year, month, 1, tzinfo=timezone.utc)
+    first_weekday = first.weekday()
+    delta = (weekday - first_weekday) % 7
+    day = 1 + delta + ((max(1, nth) - 1) * 7)
+    return day
+
+
+def us_eastern_offset_hours(utc_dt: datetime) -> int:
+    dt_utc = utc_dt.astimezone(timezone.utc)
+    year = dt_utc.year
+
+    # DST starts second Sunday in March at 2:00 AM EST => 07:00 UTC
+    dst_start_day = nth_weekday_of_month(year, 3, weekday=6, nth=2)
+    dst_start_utc = datetime(year, 3, dst_start_day, 7, 0, tzinfo=timezone.utc)
+
+    # DST ends first Sunday in November at 2:00 AM EDT => 06:00 UTC
+    dst_end_day = nth_weekday_of_month(year, 11, weekday=6, nth=1)
+    dst_end_utc = datetime(year, 11, dst_end_day, 6, 0, tzinfo=timezone.utc)
+
+    if dst_start_utc <= dt_utc < dst_end_utc:
+        return -4
+    return -5
+
+
+def to_us_eastern_datetime(utc_dt: datetime) -> datetime:
+    dt_utc = utc_dt.astimezone(timezone.utc)
+    offset_hours = us_eastern_offset_hours(dt_utc)
+    return dt_utc + timedelta(hours=offset_hours)
+
+
+def build_hourly_up_or_down_slug(symbol: str, start_utc: datetime) -> str:
+    asset_by_symbol = {
+        "BTC": "bitcoin",
+        "ETH": "ethereum",
+        "SOL": "solana",
+        "XRP": "xrp",
+    }
+    asset = asset_by_symbol.get(str(symbol).upper(), str(symbol).lower())
+    start_et = to_us_eastern_datetime(start_utc)
+    month_text = month_name_en_lower(start_et.month)
+    day = start_et.day
+    hour24 = start_et.hour
+    hour12 = hour24 % 12
+    if hour12 == 0:
+        hour12 = 12
+    ampm = "am" if hour24 < 12 else "pm"
+    return f"{asset}-up-or-down-{month_text}-{day}-{hour12}{ampm}-et"
+
+
+def build_next_market_slug_candidates(
+    preset: MonitorPreset,
+    next_start_utc: datetime,
+) -> List[str]:
+    candidates: List[str] = []
+    seen: Set[str] = set()
+
+    epoch_slug = slug_for_start_epoch(
+        int(next_start_utc.astimezone(timezone.utc).timestamp()),
+        preset.market_slug_prefix,
+    )
+    for slug in (epoch_slug,):
+        if slug and slug not in seen:
+            seen.add(slug)
+            candidates.append(slug)
+
+    if str(preset.timeframe_label).lower() == "1h":
+        human_slug = build_hourly_up_or_down_slug(preset.symbol, next_start_utc)
+        if human_slug and human_slug not in seen:
+            seen.add(human_slug)
+            candidates.append(human_slug)
+
+    return candidates
+
+
 def fetch_next_window_market_snapshot(
     preset: MonitorPreset,
     current_window_end: datetime,
 ) -> Dict[str, object]:
     next_start = current_window_end.astimezone(timezone.utc)
     next_end = next_start + timedelta(seconds=preset.window_seconds)
-    next_slug = slug_for_start_epoch(int(next_start.timestamp()), preset.market_slug_prefix)
+    slug_candidates = build_next_market_slug_candidates(preset, next_start)
+    next_slug = slug_candidates[0] if slug_candidates else ""
     snapshot: Dict[str, object] = {
         "next_slug": next_slug,
         "next_window_label": f"{dt_to_local_hhmm(next_start)}-{dt_to_local_hhmm(next_end)}",
@@ -1441,32 +1537,41 @@ def fetch_next_window_market_snapshot(
         "next_market_state": "N/D",
     }
     try:
-        resp = HTTP.get(f"{GAMMA_BASE}/markets/slug/{next_slug}", timeout=10)
-        if resp.status_code != 200:
-            snapshot["next_market_state"] = f"unavailable ({resp.status_code})"
+        last_status: Optional[int] = None
+        for candidate_slug in slug_candidates:
+            resp = HTTP.get(f"{GAMMA_BASE}/markets/slug/{candidate_slug}", timeout=10)
+            if resp.status_code != 200:
+                last_status = resp.status_code
+                continue
+
+            market = resp.json() or {}
+            up_price, down_price = parse_gamma_up_down_prices(market)
+            up_token_id, down_token_id = parse_gamma_up_down_token_ids(market)
+            snapshot["next_slug"] = candidate_slug
+            snapshot["next_up_price"] = up_price
+            snapshot["next_down_price"] = down_price
+            snapshot["next_up_token_id"] = up_token_id
+            snapshot["next_down_token_id"] = down_token_id
+            snapshot["next_best_bid"] = parse_float(str(market.get("bestBid")))
+            snapshot["next_best_ask"] = parse_float(str(market.get("bestAsk")))
+
+            accepting_orders = market.get("acceptingOrders")
+            is_active = market.get("active")
+            is_closed = market.get("closed")
+            if accepting_orders is True:
+                snapshot["next_market_state"] = "OPEN"
+            elif is_active is True and is_closed is False:
+                snapshot["next_market_state"] = "ACTIVE"
+            elif is_closed is True:
+                snapshot["next_market_state"] = "CLOSED"
+            else:
+                snapshot["next_market_state"] = "N/D"
             return snapshot
 
-        market = resp.json() or {}
-        up_price, down_price = parse_gamma_up_down_prices(market)
-        up_token_id, down_token_id = parse_gamma_up_down_token_ids(market)
-        snapshot["next_up_price"] = up_price
-        snapshot["next_down_price"] = down_price
-        snapshot["next_up_token_id"] = up_token_id
-        snapshot["next_down_token_id"] = down_token_id
-        snapshot["next_best_bid"] = parse_float(str(market.get("bestBid")))
-        snapshot["next_best_ask"] = parse_float(str(market.get("bestAsk")))
-
-        accepting_orders = market.get("acceptingOrders")
-        is_active = market.get("active")
-        is_closed = market.get("closed")
-        if accepting_orders is True:
-            snapshot["next_market_state"] = "OPEN"
-        elif is_active is True and is_closed is False:
-            snapshot["next_market_state"] = "ACTIVE"
-        elif is_closed is True:
-            snapshot["next_market_state"] = "CLOSED"
+        if last_status is None:
+            snapshot["next_market_state"] = "unavailable"
         else:
-            snapshot["next_market_state"] = "N/D"
+            snapshot["next_market_state"] = f"unavailable ({last_status})"
         return snapshot
     except Exception as exc:
         snapshot["next_market_state"] = f"error ({exc.__class__.__name__})"
