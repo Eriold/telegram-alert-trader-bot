@@ -1514,6 +1514,7 @@ def build_preview_payload(
     return {
         "crypto": preset.symbol,
         "timeframe": preset.timeframe_label,
+        "market_key": f"{preset.symbol}-{preset.timeframe_label}",
         "operation_pattern": operation_pattern,
         "operation_target_pattern": operation_target_pattern,
         "operation_trigger": operation_pattern_trigger,
@@ -1554,9 +1555,13 @@ def build_preview_payload(
         "usd_entry": format_optional_decimal(usd_entry, decimals=2),
         "usd_exit": format_optional_decimal(usd_exit, decimals=2),
         "usd_profit": format_optional_decimal(usd_profit, decimals=2),
+        "entry_price_value": entry_price,
+        "target_exit_price_value": target_exit_price,
+        "target_profit_pct_value": operation_preview_target_profit_pct,
+        "shares_value": operation_preview_shares,
         "preview_mode_badge": "PREVIEW",
         "preview_footer": (
-            'Boton "Confirmar operacion" activo solo para simulacion. '
+            "Botones de salida 70%/80%/0.99 activos solo para simulacion. "
             "No ejecuta ordenes reales."
         ),
     }
