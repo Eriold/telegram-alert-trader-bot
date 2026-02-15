@@ -28,6 +28,7 @@ EXIT_LIMIT_FAILURE_TAG = "[EXIT_LIMIT_RETRY_FAILED]"
 DEFAULT_ENTRY_TOKEN_RESOLVE_WAIT_SECONDS = 30
 DEFAULT_ENTRY_TOKEN_RESOLVE_POLL_SECONDS = 2.0
 DEFAULT_MAX_MARKET_ENTRY_PRICE = 0.56
+DEFAULT_EXIT_SIZE_DECIMALS = 4
 
 
 def extract_order_id(payload: object) -> str:
@@ -83,6 +84,43 @@ def fetch_wallet_usdc_balance(
         return normalize_usdc_balance(collateral.get("balance"))
     except Exception:
         return None
+
+def normalize_conditional_balance(raw_balance: object) -> Optional[float]:
+    raw_text = str(raw_balance).strip()
+    if not raw_text:
+        return None
+    value = parse_float(raw_text)
+    if value is None:
+        return None
+    if "." in raw_text:
+        return value
+    # CLOB balance_allowance for outcome tokens is returned in 6-decimal base units.
+    return value / 1_000_000.0
+
+def fetch_outcome_token_balance(
+    client: ClobClient,
+    signature_type: int,
+    token_id: str,
+) -> Optional[float]:
+    token = str(token_id).strip()
+    if not token:
+        return None
+    try:
+        conditional = client.get_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token,
+                signature_type=signature_type,
+            )
+        )
+        return normalize_conditional_balance(conditional.get("balance"))
+    except Exception:
+        return None
+
+def floor_order_size(value: float, decimals: int = DEFAULT_EXIT_SIZE_DECIMALS) -> float:
+    precision = max(0, int(decimals))
+    factor = 10 ** precision
+    return int(max(0.0, float(value)) * factor) / float(factor)
 
 def init_trading_client(env: Dict[str, str]) -> Tuple[Optional[ClobClient], str, int]:
     host = env.get("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com").strip()
@@ -757,6 +795,26 @@ def execute_live_trade_from_preview(
     exit_size = float(shares)
     if filled_size is not None and filled_size > 0:
         exit_size = filled_size
+    available_exit_balance = fetch_outcome_token_balance(
+        client,
+        signature_type,
+        entry_token_id,
+    )
+    if available_exit_balance is not None:
+        max_sellable = max(0.0, available_exit_balance - 0.000001)
+        exit_size = min(exit_size, max_sellable)
+        context["entry_token_balance_available"] = format_optional_decimal(
+            available_exit_balance,
+            decimals=6,
+        )
+    else:
+        context["entry_token_balance_available"] = "N/D"
+    exit_size = floor_order_size(exit_size, decimals=DEFAULT_EXIT_SIZE_DECIMALS)
+    if exit_size <= 0:
+        raise RuntimeError(
+            "Balance disponible del token de salida es insuficiente; "
+            "no se pudo crear orden limit."
+        )
 
     (
         exit_response,

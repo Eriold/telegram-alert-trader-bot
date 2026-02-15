@@ -223,8 +223,12 @@ async def command_loop(
                                 )
                             if callback_chat_id is not None:
                                 if EXIT_LIMIT_FAILURE_TAG in error_text:
-                                    urgent_message = build_live_urgent_exit_limit_failure_message(
+                                    urgent_context, _ = apply_preview_target_to_context(
                                         preview_context,
+                                        target_code,
+                                    )
+                                    urgent_message = build_live_urgent_exit_limit_failure_message(
+                                        urgent_context,
                                         error_text,
                                         wallet_history_url,
                                     )

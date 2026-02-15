@@ -8,19 +8,19 @@ PREVIEW_CALLBACK_SEPARATOR = "|"
 DEFAULT_PREVIEW_TARGET_CODE = "tp80"
 PREVIEW_TARGET_OPTIONS: Dict[str, Dict[str, object]] = {
     "tp70": {
-        "button": "?? Salir 70%",
+        "button": "⚪ Salir 0.70",
         "name": "Salida fija 0.70",
         "kind": "price",
         "value": 0.70,
     },
     "tp80": {
-        "button": "?? Salir 80%",
+        "button": "🟢 Salir 0.80",
         "name": "Salida fija 0.80",
         "kind": "price",
         "value": 0.80,
     },
     "tp99": {
-        "button": "?? Venc. 0.99",
+        "button": "🔵 Venc. 0.99",
         "name": "Salida fija 0.99",
         "kind": "price",
         "value": 0.99,
