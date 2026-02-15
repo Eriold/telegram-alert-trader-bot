@@ -178,16 +178,25 @@ def build_help_message(trading_mode: str) -> str:
         "<code>/current-btc15m</code> -> Crea preview para operar la vela actual BTC 15m\n"
         "<code>/current-btc1h</code> -> Crea preview para operar la vela actual BTC 1h\n"
         "Botones de salida fija en cada preview: <code>0.70</code>, <code>0.80</code>, <code>0.99</code>\n\n"
-        "<b>Preview manual</b>\n"
-        "<code>/eth15m-B-sha-10-V-0.50</code> -> Ejemplo compra YES manual\n"
-        "<code>/btc1h-S-sha-6-V-0.45-tp-70</code> -> Ejemplo compra NO manual con TP 70\n\n"
-        "<b>Sintaxis manual</b>\n"
-        "<code>/{mercado}-{lado}-sha-{shares}-V-{precio}[-tp-{70|80|99}]</code>\n"
-        "<code>{mercado}</code> = eth15m | eth1h | btc15m | btc1h\n"
-        "<code>{lado}</code> = B (YES) | S (NO)\n"
-        "<code>{shares}</code> = cantidad de shares\n"
-        "<code>{precio}</code> = precio estimado de entrada (0.01 a 0.99)\n"
-        "<code>{tp}</code> = salida fija opcional: 70->0.70, 80->0.80, 99->0.99\n\n"
+        "<b>Operar Manualmente</b>\n"
+        "<code>/{mercado}-{lado}-sha-{shares}-V-{precio|market}[-tp-{70|80|99}]-{next|now}</code>\n"
+        "Genera un preview manual para confirmar por botones.\n"
+        "La parte final <code>-next</code> o <code>-now</code> es obligatoria.\n"
+        "<code>{mercado}</code> -> eth15m | eth1h | btc15m | btc1h\n"
+        "<code>{lado}</code> -> B=BUY/YES (UP) | S=BUY/NO (DOWN)\n"
+        "<code>sha</code> -> etiqueta fija del comando\n"
+        "<code>{shares}</code> -> cantidad de shares (> 0)\n"
+        "<code>V</code> -> etiqueta fija del comando\n"
+        "<code>{precio}</code> -> precio fijo de entrada (0.01 a 0.99)\n"
+        "<code>market</code> -> toma precio real del mercado objetivo (segun lado y scope)\n"
+        "<code>tp</code> -> opcional: 70->0.70, 80->0.80, 99->0.99\n"
+        "<code>next</code> -> prepara entrada para la proxima vela\n"
+        "<code>now</code> -> prepara entrada para la vela actual (live)\n"
+        "Si omites <code>-tp-...</code>, se usa <code>tp80</code> por defecto.\n\n"
+        "<b>Ejemplos Manuales</b>\n"
+        "<code>/eth15m-B-sha-10-V-0.50-next</code> -> ETH 15m, BUY YES, 10 shares, precio fijo 0.50, proxima vela\n"
+        "<code>/btc1h-S-sha-6-V-market-tp-70-now</code> -> BTC 1h, BUY NO, 6 shares, precio market, vela actual, salida 0.70\n"
+        "<code>/btc15m-B-sha-4-V-market-next</code> -> BTC 15m, BUY YES, 4 shares, market proxima vela, salida 0.80 (default)\n\n"
         "<b>Ayuda</b>\n"
         "<code>/help</code> -> Muestra esta guia\n\n"
         f"<i>Modo actual: {mode_label}. {mode_note}</i>"
@@ -195,7 +204,7 @@ def build_help_message(trading_mode: str) -> str:
 
 def parse_manual_preview_command(cmd: str) -> Optional[Dict[str, object]]:
     parts = [p.strip().lower() for p in cmd.split("-") if p.strip()]
-    if len(parts) not in (6, 8):
+    if len(parts) not in (7, 9):
         return None
     market_cmd = parts[0]
     if market_cmd not in MANUAL_PREVIEW_MARKET_COMMANDS:
@@ -204,11 +213,16 @@ def parse_manual_preview_command(cmd: str) -> Optional[Dict[str, object]]:
     if parts[2] != "sha" or parts[4] != "v":
         return None
     shares = parse_int(parts[3])
-    entry_price = parse_float(parts[5])
     if shares is None or shares <= 0:
         return None
-    if entry_price is None or entry_price <= 0 or entry_price > 0.99:
-        return None
+
+    price_token = parts[5]
+    use_market_price = price_token in ("market", "mkt", "live")
+    entry_price: Optional[float] = None
+    if not use_market_price:
+        entry_price = parse_float(price_token)
+        if entry_price is None or entry_price <= 0 or entry_price > 0.99:
+            return None
 
     if side_token in ("b", "buy", "yes", "y"):
         entry_side = "YES"
@@ -220,7 +234,11 @@ def parse_manual_preview_command(cmd: str) -> Optional[Dict[str, object]]:
         return None
 
     target_code = DEFAULT_PREVIEW_TARGET_CODE
-    if len(parts) == 8:
+    scope_token = parts[-1]
+    if scope_token not in ("next", "now"):
+        return None
+
+    if len(parts) == 9:
         if parts[6] != "tp":
             return None
         tp_token = parts[7]
@@ -234,6 +252,8 @@ def parse_manual_preview_command(cmd: str) -> Optional[Dict[str, object]]:
         "inferred_current_dir": inferred_current_dir,
         "shares": shares,
         "entry_price": entry_price,
+        "entry_price_mode": "market" if use_market_price else "fixed",
+        "entry_scope": scope_token,
         "target_code": target_code,
     }
 

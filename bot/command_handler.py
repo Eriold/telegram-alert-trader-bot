@@ -19,6 +19,7 @@ from bot.live_trading import (
 )
 from bot.preview_controls import (
     DEFAULT_PREVIEW_TARGET_CODE,
+    MANUAL_PREVIEW_MARKET_COMMANDS,
     PREVIEW_TARGET_OPTIONS,
     apply_current_window_snapshot_to_preview,
     apply_preview_target_to_context,
@@ -615,6 +616,13 @@ async def command_loop(
                     max_live_price_age_seconds,
                 )
 
+                manual_scope = str(manual_preview.get("entry_scope") or "next").lower()
+                scope_label = "NOW" if manual_scope == "now" else "NEXT"
+                manual_price_mode = str(manual_preview.get("entry_price_mode") or "fixed").lower()
+                manual_entry_price = parse_float(str(manual_preview.get("entry_price")))
+                manual_entry_side = str(manual_preview["entry_side"])
+                manual_entry_outcome = "UP" if manual_entry_side == "YES" else "DOWN"
+
                 preview_data = build_preview_payload(
                     preset=preset,
                     w_start=w_start,
@@ -623,26 +631,58 @@ async def command_loop(
                     live_price=live_price,
                     current_dir=str(manual_preview["inferred_current_dir"]),
                     current_delta=None,
-                    operation_pattern=f"MANUAL {manual_preview['entry_side']}",
+                    operation_pattern=f"MANUAL {manual_entry_side} {scope_label}",
                     operation_pattern_trigger=operation_pattern_trigger,
                     operation_preview_shares=int(manual_preview["shares"]),
-                    operation_preview_entry_price=float(manual_preview["entry_price"]),
+                    operation_preview_entry_price=(
+                        None if manual_price_mode == "market" else manual_entry_price
+                    ),
                     operation_preview_target_profit_pct=operation_preview_target_profit_pct,
                 )
-                preview_data["operation_pattern"] = f"MANUAL {manual_preview['entry_side']}"
+                if manual_scope == "now":
+                    preview_data = apply_current_window_snapshot_to_preview(
+                        preview_data,
+                        preset,
+                        w_start,
+                    )
+                else:
+                    preview_data["entry_scope"] = "next"
+
+                preview_data["operation_pattern"] = f"MANUAL {manual_entry_side} {scope_label}"
                 preview_data["operation_target_pattern"] = "MANUAL"
-                preview_data["entry_side"] = str(manual_preview["entry_side"])
-                preview_data["entry_outcome"] = (
-                    "UP" if str(manual_preview["entry_side"]) == "YES" else "DOWN"
-                )
-                preview_data["entry_price_value"] = float(manual_preview["entry_price"])
-                preview_data["entry_price"] = format_optional_decimal(
-                    float(manual_preview["entry_price"]),
-                    decimals=3,
-                )
-                preview_data["entry_price_source"] = "manual_command"
+                preview_data["entry_side"] = manual_entry_side
+                preview_data["entry_outcome"] = manual_entry_outcome
                 preview_data["shares"] = int(manual_preview["shares"])
                 preview_data["shares_value"] = int(manual_preview["shares"])
+
+                if manual_entry_outcome == "UP":
+                    market_entry_price = parse_float(str(preview_data.get("next_up_price")))
+                    market_entry_token_id = str(preview_data.get("next_up_token_id") or "")
+                else:
+                    market_entry_price = parse_float(str(preview_data.get("next_down_price")))
+                    market_entry_token_id = str(preview_data.get("next_down_token_id") or "")
+                if market_entry_token_id:
+                    preview_data["entry_token_id"] = market_entry_token_id
+
+                scope_source = "current" if manual_scope == "now" else "next"
+                if manual_price_mode == "market":
+                    preview_data["entry_price_value"] = market_entry_price
+                    preview_data["entry_price"] = format_optional_decimal(
+                        market_entry_price,
+                        decimals=3,
+                    )
+                    if market_entry_price is None:
+                        preview_data["entry_price_source"] = f"manual_market_{scope_source}:N/D"
+                    else:
+                        preview_data["entry_price_source"] = f"manual_market_{scope_source}:gamma"
+                else:
+                    preview_data["entry_price_value"] = manual_entry_price
+                    preview_data["entry_price"] = format_optional_decimal(
+                        manual_entry_price,
+                        decimals=3,
+                    )
+                    preview_data["entry_price_source"] = f"manual_fixed_{scope_source}"
+
                 preview_data, _ = apply_preview_target_to_context(
                     preview_data,
                     str(manual_preview["target_code"]),
@@ -661,6 +701,27 @@ async def command_loop(
                     preview_message,
                     parse_mode=parse_mode,
                     reply_markup=build_preview_reply_markup(preview_id),
+                )
+                continue
+
+            if (
+                any(cmd.startswith(f"{market}-") for market in MANUAL_PREVIEW_MARKET_COMMANDS)
+                and "-sha-" in cmd
+                and "-v-" in cmd
+            ):
+                send_telegram(
+                    token,
+                    str(chat_id),
+                    (
+                        "<b>Formato manual invalido</b>\n"
+                        "Usa:\n"
+                        "<code>/{mercado}-{lado}-sha-{shares}-V-{precio|market}"
+                        "[-tp-{70|80|99}]-{next|now}</code>\n"
+                        "Ejemplos:\n"
+                        "<code>/eth15m-B-sha-10-V-0.50-next</code>\n"
+                        "<code>/btc1h-S-sha-6-V-market-tp-70-now</code>"
+                    ),
+                    parse_mode=parse_mode,
                 )
                 continue
 
