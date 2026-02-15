@@ -4,7 +4,11 @@ Este directorio concentra la logica compartida del bot para reducir el tamano de
 
 ## Modulos
 
-- `core_utils.py`: helpers de runtime (env/config), estado, DB/history, preview, Telegram HTTP y utilidades de mercado.
+- `preview_controls.py`: templates de preview, botones inline, parseo de comandos manuales y decoracion de mensajes.
+- `live_trading.py`: inicializacion de cliente CLOB, ejecucion de ordenes, reintentos de salida limit y monitoreo de cierres.
+- `command_handler.py`: loop de comandos de Telegram (`/eth15m`, `/preview-*`, `/current-*`, callbacks).
+- `alert_service.py`: loop principal de alertas y orquestacion de tareas async.
+- `core_utils.py`: utilidades compartidas (env/config, DB/history, Gamma/Binance, RTDS, Telegram HTTP, formato).
 
 ## Entry point
 
@@ -14,4 +18,4 @@ El punto de entrada sigue siendo `alert_runner.py` y se ejecuta igual:
 python alert_runner.py
 ```
 
-`alert_runner.py` ahora mantiene los bucles principales (`command_loop`, `alert_loop`) y reutiliza `bot/core_utils.py` para toda la logica auxiliar.
+`alert_runner.py` ahora solo inicia el servicio (`alert_loop`) y toda la logica operativa vive en los modulos de `bot/`.
