@@ -1400,6 +1400,28 @@ def parse_gamma_up_down_prices(market: Dict[str, object]) -> Tuple[Optional[floa
     return up_price, down_price
 
 
+def parse_gamma_up_down_token_ids(market: Dict[str, object]) -> Tuple[Optional[str], Optional[str]]:
+    outcomes = parse_list_like(market.get("outcomes"))
+    token_ids = parse_list_like(market.get("clobTokenIds"))
+    outcome_map: Dict[str, str] = {}
+    max_len = min(len(outcomes), len(token_ids))
+    for idx in range(max_len):
+        outcome_label = str(outcomes[idx]).strip().lower()
+        token_id = str(token_ids[idx]).strip()
+        if not token_id:
+            continue
+        outcome_map[outcome_label] = token_id
+
+    up_token_id = outcome_map.get("up")
+    down_token_id = outcome_map.get("down")
+    if up_token_id is None or down_token_id is None:
+        fallback_ids = [str(v).strip() for v in token_ids if str(v).strip()]
+        if len(fallback_ids) >= 2:
+            up_token_id = fallback_ids[0]
+            down_token_id = fallback_ids[1]
+    return up_token_id, down_token_id
+
+
 def fetch_next_window_market_snapshot(
     preset: MonitorPreset,
     current_window_end: datetime,
@@ -1412,6 +1434,8 @@ def fetch_next_window_market_snapshot(
         "next_window_label": f"{dt_to_local_hhmm(next_start)}-{dt_to_local_hhmm(next_end)}",
         "next_up_price": None,
         "next_down_price": None,
+        "next_up_token_id": None,
+        "next_down_token_id": None,
         "next_best_bid": None,
         "next_best_ask": None,
         "next_market_state": "N/D",
@@ -1424,8 +1448,11 @@ def fetch_next_window_market_snapshot(
 
         market = resp.json() or {}
         up_price, down_price = parse_gamma_up_down_prices(market)
+        up_token_id, down_token_id = parse_gamma_up_down_token_ids(market)
         snapshot["next_up_price"] = up_price
         snapshot["next_down_price"] = down_price
+        snapshot["next_up_token_id"] = up_token_id
+        snapshot["next_down_token_id"] = down_token_id
         snapshot["next_best_bid"] = parse_float(str(market.get("bestBid")))
         snapshot["next_best_ask"] = parse_float(str(market.get("bestAsk")))
 
@@ -1476,13 +1503,26 @@ def build_preview_payload(
         operation_target_pattern = f"UP{operation_pattern_trigger}"
 
     entry_price: Optional[float] = None
+    entry_token_id: Optional[str] = None
     entry_price_source = "N/D"
     next_up_price = next_snapshot.get("next_up_price")
     next_down_price = next_snapshot.get("next_down_price")
+    next_up_token_id = (
+        str(next_snapshot.get("next_up_token_id"))
+        if next_snapshot.get("next_up_token_id")
+        else None
+    )
+    next_down_token_id = (
+        str(next_snapshot.get("next_down_token_id"))
+        if next_snapshot.get("next_down_token_id")
+        else None
+    )
     if entry_outcome == "UP":
         entry_price = next_up_price if isinstance(next_up_price, float) else None
+        entry_token_id = next_up_token_id
     elif entry_outcome == "DOWN":
         entry_price = next_down_price if isinstance(next_down_price, float) else None
+        entry_token_id = next_down_token_id
 
     if entry_price is not None:
         entry_price_source = f"gamma:{next_snapshot.get('next_slug')}"
@@ -1521,22 +1561,26 @@ def build_preview_payload(
         "direction_emoji": direction_emoji,
         "window_label": window_label,
         "next_window_label": str(next_snapshot.get("next_window_label", "N/D")),
+        "next_slug": str(next_snapshot.get("next_slug", "N/D")),
         "seconds_to_end": format_seconds(seconds_to_end),
         "price_now": fmt_usd(live_price),
         "distance_signed": signed_delta,
         "shares": operation_preview_shares,
         "entry_side": entry_side,
         "entry_outcome": entry_outcome,
+        "entry_token_id": entry_token_id or "",
         "entry_price": format_optional_decimal(entry_price, decimals=3),
         "entry_price_source": entry_price_source,
         "next_up_price": format_optional_decimal(
             next_up_price if isinstance(next_up_price, float) else None,
             decimals=3,
         ),
+        "next_up_token_id": next_up_token_id or "",
         "next_down_price": format_optional_decimal(
             next_down_price if isinstance(next_down_price, float) else None,
             decimals=3,
         ),
+        "next_down_token_id": next_down_token_id or "",
         "next_best_bid": format_optional_decimal(
             next_snapshot.get("next_best_bid")
             if isinstance(next_snapshot.get("next_best_bid"), float)
@@ -1637,6 +1681,29 @@ def answer_callback_query(
         return True
     except Exception as exc:
         print(f"Telegram callback error: {exc}")
+        return False
+
+
+def clear_inline_keyboard(
+    token: str,
+    chat_id: str,
+    message_id: int,
+) -> bool:
+    url = f"https://api.telegram.org/bot{token}/editMessageReplyMarkup"
+    payload: Dict[str, object] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": json.dumps({"inline_keyboard": []}, separators=(",", ":")),
+    }
+    try:
+        resp = HTTP.post(url, data=payload, timeout=10)
+        if resp.status_code >= 400:
+            # Message may be too old/edited already; do not break trade flow.
+            print(f"Telegram edit markup error {resp.status_code}: {resp.text[:200]}")
+            return False
+        return True
+    except Exception as exc:
+        print(f"Telegram edit markup error: {exc}")
         return False
 
 

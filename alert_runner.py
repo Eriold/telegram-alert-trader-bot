@@ -1,6 +1,17 @@
 ﻿from __future__ import annotations
 
+import time
+
 from bot.core_utils import *
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import (
+    ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
+    MarketOrderArgs,
+    OrderArgs,
+    OrderType,
+)
 
 PREVIEW_CALLBACK_SEPARATOR = "|"
 DEFAULT_PREVIEW_TARGET_CODE = "tp80"
@@ -25,6 +36,11 @@ PREVIEW_TARGET_OPTIONS: Dict[str, Dict[str, object]] = {
     },
 }
 MANUAL_PREVIEW_MARKET_COMMANDS = {"eth15m", "eth1h", "btc15m", "btc1h"}
+LIVE_TRADES_STATE_PATH = os.path.join(BASE_DIR, "live_trades_state.json")
+DEFAULT_TRADING_MODE = "preview"
+DEFAULT_ORDER_MONITOR_POLL_SECONDS = 10
+DEFAULT_ORDER_MONITOR_RETRY_SECONDS = 30
+DEFAULT_ENTRY_ORDER_WAIT_SECONDS = 8
 
 
 def resolve_preview_target_code(raw_code: Optional[str]) -> str:
@@ -153,19 +169,39 @@ def build_preview_selection_message(
     )
 
 
-def build_help_message() -> str:
+def build_help_message(trading_mode: str) -> str:
+    mode_label = "live" if trading_mode == "live" else "preview"
+    mode_note = (
+        "Botones de preview ejecutan orden REAL."
+        if trading_mode == "live"
+        else "Botones de preview NO ejecutan ordenes reales."
+    )
     return (
-        "<b>Comandos disponibles</b>\n\n"
-        "<b>Status</b>\n"
-        "/eth15m, /eth1h, /btc15m, /btc1h\n\n"
+        "<b>Guia de comandos</b>\n\n"
+        "<b>Estado de mercado</b>\n"
+        "<code>/eth15m</code> -> Estado ETH 15m (precio live + sesiones recientes)\n"
+        "<code>/eth1h</code> -> Estado ETH 1h\n"
+        "<code>/btc15m</code> -> Estado BTC 15m\n"
+        "<code>/btc1h</code> -> Estado BTC 1h\n\n"
         "<b>Preview automatico</b>\n"
-        "/preview-eth15m, /preview-eth1h, /preview-btc15m, /preview-btc1h\n"
-        "Cada preview trae 3 botones de salida: 70%, 80%, 0.99.\n\n"
+        "<code>/preview-eth15m</code> -> Crea preview de operacion ETH 15m\n"
+        "<code>/preview-eth1h</code> -> Crea preview de operacion ETH 1h\n"
+        "<code>/preview-btc15m</code> -> Crea preview de operacion BTC 15m\n"
+        "<code>/preview-btc1h</code> -> Crea preview de operacion BTC 1h\n"
+        "Botones de salida disponibles en cada preview: <code>70%</code>, <code>80%</code>, <code>0.99</code>\n\n"
         "<b>Preview manual</b>\n"
-        "/eth15m-B-sha-10-V-0.50\n"
-        "/btc1h-S-sha-6-V-0.45-tp-70\n"
-        "B=YES, S=NO, sha=shares, V=precio entrada, tp=70|80|99.\n\n"
-        "<i>Modo actual: preview (sin ejecucion real).</i>"
+        "<code>/eth15m-B-sha-10-V-0.50</code> -> Ejemplo compra YES manual\n"
+        "<code>/btc1h-S-sha-6-V-0.45-tp-70</code> -> Ejemplo compra NO manual con TP 70\n\n"
+        "<b>Sintaxis manual</b>\n"
+        "<code>/{mercado}-{lado}-sha-{shares}-V-{precio}[-tp-{70|80|99}]</code>\n"
+        "<code>{mercado}</code> = eth15m | eth1h | btc15m | btc1h\n"
+        "<code>{lado}</code> = B (YES) | S (NO)\n"
+        "<code>{shares}</code> = cantidad de shares\n"
+        "<code>{precio}</code> = precio estimado de entrada (0.01 a 0.99)\n"
+        "<code>{tp}</code> = objetivo de salida opcional\n\n"
+        "<b>Ayuda</b>\n"
+        "<code>/help</code> -> Muestra esta guia\n\n"
+        f"<i>Modo actual: {mode_label}. {mode_note}</i>"
     )
 
 
@@ -213,11 +249,528 @@ def parse_manual_preview_command(cmd: str) -> Optional[Dict[str, object]]:
         "target_code": target_code,
     }
 
+
+def normalize_trading_mode(raw_mode: Optional[str]) -> str:
+    if not raw_mode:
+        return DEFAULT_TRADING_MODE
+    mode = str(raw_mode).strip().lower()
+    if mode in ("preview", "live"):
+        return mode
+    return DEFAULT_TRADING_MODE
+
+
+def decorate_preview_payload_for_mode(
+    preview_payload: Dict[str, object],
+    trading_mode: str,
+) -> Dict[str, object]:
+    payload = dict(preview_payload)
+    if trading_mode == "live":
+        payload["preview_mode_badge"] = "LIVE READY"
+        payload["preview_footer"] = (
+            "Al confirmar, el bot enviara orden REAL (market + limit) "
+            "segun el boton 70%/80%/0.99. Primer clic bloquea el preview."
+        )
+    else:
+        payload["preview_mode_badge"] = "PREVIEW"
+        payload["preview_footer"] = (
+            "Botones 70%/80%/0.99 activos solo para simulacion. "
+            "No ejecuta ordenes reales. Primer clic bloquea el preview."
+        )
+    return payload
+
+
+def build_wallet_history_url(wallet_address: Optional[str]) -> str:
+    wallet = str(wallet_address or "").strip()
+    if not wallet:
+        return ""
+    return f"https://zapper.xyz/es/account/{wallet}?tab=history"
+
+
+def extract_order_id(payload: object) -> str:
+    if isinstance(payload, dict):
+        for key in ("orderID", "id", "order_id", "orderId"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+        order_block = payload.get("order")
+        if isinstance(order_block, dict):
+            for key in ("id", "orderID", "order_id", "orderId"):
+                value = order_block.get(key)
+                if value:
+                    return str(value)
+    return ""
+
+
+def extract_tx_hash(payload: object) -> str:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            key_text = str(key).lower()
+            if "hash" in key_text and value:
+                return str(value)
+            nested = extract_tx_hash(value)
+            if nested:
+                return nested
+    elif isinstance(payload, list):
+        for item in payload:
+            nested = extract_tx_hash(item)
+            if nested:
+                return nested
+    return ""
+
+
+def normalize_usdc_balance(raw_balance: object) -> Optional[float]:
+    value = parse_float(str(raw_balance))
+    if value is None:
+        return None
+    # CLOB usually returns USDC with 6 decimals as integer-like string.
+    if value > 1000:
+        return value / 1_000_000.0
+    return value
+
+
+def fetch_wallet_usdc_balance(
+    client: ClobClient,
+    signature_type: int,
+) -> Optional[float]:
+    try:
+        collateral = client.get_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=signature_type,
+            )
+        )
+        return normalize_usdc_balance(collateral.get("balance"))
+    except Exception:
+        return None
+
+
+def init_trading_client(env: Dict[str, str]) -> Tuple[Optional[ClobClient], str, int]:
+    host = env.get("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com").strip()
+    chain_id = parse_int(env.get("POLYMARKET_CHAIN_ID"))
+    if chain_id is None:
+        chain_id = 137
+    signature_type = parse_int(env.get("POLYMARKET_SIGNATURE_TYPE"))
+    if signature_type is None:
+        signature_type = 2
+    funder = env.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
+    wallet_key = (
+        env.get("POLYMARKET_WALLET_PRIVATE_KEY", "").strip()
+        or env.get("POLYMARKET_PRIVATE_KEY", "").strip()
+    )
+    if not wallet_key:
+        return None, "Fase 3 live: falta POLYMARKET_WALLET_PRIVATE_KEY.", signature_type
+    if not funder:
+        return None, "Fase 3 live: falta POLYMARKET_FUNDER_ADDRESS.", signature_type
+
+    try:
+        client = ClobClient(
+            host,
+            chain_id=chain_id,
+            key=wallet_key,
+            signature_type=signature_type,
+            funder=funder,
+        )
+    except Exception as exc:
+        return None, f"Fase 3 live: no se pudo inicializar ClobClient ({exc}).", signature_type
+
+    derive_api_creds = parse_bool(env.get("POLYMARKET_DERIVE_API_CREDS"), default=True)
+    nonce = parse_int(env.get("POLYMARKET_API_KEY_NONCE"))
+    if nonce is None:
+        nonce = 0
+    api_key = env.get("POLYMARKET_API_KEY", "").strip()
+    api_secret = env.get("POLYMARKET_API_SECRET", "").strip()
+    api_passphrase = env.get("POLYMARKET_API_PASSPHRASE", "").strip()
+    creds: Optional[ApiCreds] = None
+    if api_key and api_secret and api_passphrase:
+        creds = ApiCreds(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+        )
+    elif derive_api_creds:
+        try:
+            creds = client.create_or_derive_api_creds(nonce=nonce)
+        except Exception as exc:
+            return None, f"Fase 3 live: no se pudieron derivar API creds ({exc}).", signature_type
+    else:
+        return (
+            None,
+            "Fase 3 live: faltan API creds y POLYMARKET_DERIVE_API_CREDS=0.",
+            signature_type,
+        )
+
+    try:
+        client.set_api_creds(creds)
+        client.assert_level_2_auth()
+    except Exception as exc:
+        return None, f"Fase 3 live: auth L2 fallida ({exc}).", signature_type
+    return client, "Fase 3 live: cliente CLOB listo.", signature_type
+
+
+def load_live_trades_state(path: str) -> Dict[str, Dict[str, object]]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle) or {}
+            if isinstance(data, dict):
+                output: Dict[str, Dict[str, object]] = {}
+                for key, value in data.items():
+                    if isinstance(value, dict):
+                        output[str(key)] = value
+                return output
+    except Exception:
+        return {}
+    return {}
+
+
+def save_live_trades_state(path: str, trades: Dict[str, Dict[str, object]]) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(trades, handle, indent=2, sort_keys=True)
+
+
+def extract_order_status_text(order_payload: object) -> str:
+    if not isinstance(order_payload, dict):
+        return ""
+    for key in ("status", "state", "orderStatus", "order_status"):
+        value = order_payload.get(key)
+        if value:
+            return str(value).strip().lower()
+    return ""
+
+
+def is_order_filled(order_payload: object) -> bool:
+    if not isinstance(order_payload, dict):
+        return False
+    status = extract_order_status_text(order_payload)
+    if any(token in status for token in ("filled", "matched", "executed", "complete")):
+        return True
+
+    size = parse_float(str(order_payload.get("size")))
+    if size is None:
+        size = parse_float(str(order_payload.get("original_size")))
+    matched = parse_float(str(order_payload.get("size_matched")))
+    if matched is None:
+        matched = parse_float(str(order_payload.get("filled_size")))
+    if size is not None and matched is not None and size > 0 and matched >= (size * 0.999):
+        return True
+    return False
+
+
+def is_order_terminal_without_fill(order_payload: object) -> bool:
+    if not isinstance(order_payload, dict):
+        return False
+    status = extract_order_status_text(order_payload)
+    return any(
+        token in status
+        for token in (
+            "cancel",
+            "expired",
+            "reject",
+            "fail",
+            "invalid",
+        )
+    )
+
+
+def extract_filled_size(order_payload: object) -> Optional[float]:
+    if not isinstance(order_payload, dict):
+        return None
+    for key in ("size_matched", "filled_size", "sizeMatched"):
+        value = parse_float(str(order_payload.get(key)))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def wait_for_entry_order_result(
+    client: ClobClient,
+    order_id: str,
+    timeout_seconds: int = DEFAULT_ENTRY_ORDER_WAIT_SECONDS,
+    poll_seconds: int = 1,
+) -> Optional[Dict[str, object]]:
+    order_id_text = str(order_id).strip()
+    if not order_id_text:
+        return None
+
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    sleep_for = max(1, poll_seconds)
+    last_payload: Optional[Dict[str, object]] = None
+    while time.monotonic() <= deadline:
+        try:
+            payload = client.get_order(order_id_text)
+            if isinstance(payload, dict):
+                last_payload = payload
+                if is_order_filled(payload) or is_order_terminal_without_fill(payload):
+                    return payload
+        except Exception:
+            pass
+        time.sleep(sleep_for)
+    return last_payload
+
+
+def build_live_entry_message(
+    trade_record: Dict[str, object],
+    balance_after_entry: Optional[float],
+) -> str:
+    lines = [
+        "<b>Operacion ejecutada (LIVE)</b>",
+        f"Hora: {trade_record.get('executed_at_local', 'N/D')} COL",
+        f"Wallet: {trade_record.get('wallet_address', 'N/D')}",
+        f"Operacion: {trade_record.get('operation_pattern', 'N/D')} en {trade_record.get('market_key', 'N/D')}",
+        f"Shares: {trade_record.get('shares', 'N/D')}",
+        f"Shares ejecutadas: {trade_record.get('entry_filled_size', trade_record.get('shares', 'N/D'))}",
+        f"Valor Market (entrada): {trade_record.get('entry_price', 'N/D')}",
+        f"USD entrada: {trade_record.get('usd_entry', 'N/D')}",
+        f"Limit salida ({trade_record.get('target_profile_name', 'N/D')}): {trade_record.get('target_exit_price', 'N/D')}",
+        f"Shares limit salida: {trade_record.get('exit_size', trade_record.get('shares', 'N/D'))}",
+        f"USD salida esperada: {trade_record.get('usd_exit', 'N/D')}",
+        f"PnL esperado: {trade_record.get('usd_profit', 'N/D')}",
+    ]
+    entry_order_id = str(trade_record.get("entry_order_id", "") or "")
+    if entry_order_id:
+        lines.append(f"Order entrada ID: {entry_order_id}")
+    exit_order_id = str(trade_record.get("exit_order_id", "") or "")
+    if exit_order_id:
+        lines.append(f"Order salida ID: {exit_order_id}")
+    entry_tx_hash = str(trade_record.get("entry_tx_hash", "") or "")
+    if entry_tx_hash:
+        lines.append(f"Tx entrada: {entry_tx_hash}")
+    wallet_link = str(trade_record.get("wallet_history_url", "") or "")
+    if wallet_link:
+        lines.append(f"Link wallet: {wallet_link}")
+    if balance_after_entry is not None:
+        lines.append(f"Balance USDC (aprox): {balance_after_entry:,.2f}")
+    lines.append("<i>Modo live activo.</i>")
+    return "\n".join(lines)
+
+
+def build_live_close_success_message(
+    trade_record: Dict[str, object],
+    balance_after_close: Optional[float],
+) -> str:
+    lines = [
+        "<b>🎉 Cierre Exitoso (LIVE)</b>",
+        f"Mercado: {trade_record.get('market_key', 'N/D')}",
+        f"Tramo: {trade_record.get('window_label', 'N/D')}",
+        f"Ganancia estimada: {trade_record.get('usd_profit', 'N/D')} USD",
+    ]
+    wallet_link = str(trade_record.get("wallet_history_url", "") or "")
+    if wallet_link:
+        lines.append(f"Link wallet: {wallet_link}")
+    if balance_after_close is not None:
+        lines.append(f"Balance USDC (aprox): {balance_after_close:,.2f}")
+    return "\n".join(lines)
+
+
+def build_live_close_loss_message(
+    trade_record: Dict[str, object],
+    balance_after_close: Optional[float],
+    reason: str,
+) -> str:
+    lines = [
+        "<b>⚠️ Cierre no exitoso (LIVE)</b>",
+        f"Mercado: {trade_record.get('market_key', 'N/D')}",
+        f"Tramo: {trade_record.get('window_label', 'N/D')}",
+        f"Motivo: {reason}",
+        "Resultado: PnL real no confirmado (revisar wallet/orden).",
+    ]
+    wallet_link = str(trade_record.get("wallet_history_url", "") or "")
+    if wallet_link:
+        lines.append(f"Link wallet: {wallet_link}")
+    if balance_after_close is not None:
+        lines.append(f"Balance USDC (aprox): {balance_after_close:,.2f}")
+    return "\n".join(lines)
+
+
+def execute_live_trade_from_preview(
+    client: ClobClient,
+    preview_context: Dict[str, object],
+    target_code: str,
+    signature_type: int,
+    max_shares_per_trade: int,
+    max_usd_per_trade: float,
+    wallet_address: str,
+    wallet_history_url: str,
+) -> Dict[str, object]:
+    context, option_name = apply_preview_target_to_context(preview_context, target_code)
+    entry_token_id = str(context.get("entry_token_id", "")).strip()
+    if not entry_token_id:
+        raise RuntimeError("No se encontro token_id de entrada para la proxima vela.")
+
+    shares = parse_int(str(context.get("shares_value")))
+    if shares is None:
+        shares = parse_int(str(context.get("shares")))
+    if shares is None or shares <= 0:
+        raise RuntimeError("Shares invalidos para ejecucion live.")
+    if shares > max_shares_per_trade:
+        raise RuntimeError(
+            f"Shares exceden maximo permitido ({shares} > {max_shares_per_trade})."
+        )
+
+    entry_price = parse_float(str(context.get("entry_price_value")))
+    if entry_price is None:
+        entry_price = parse_float(str(context.get("entry_price")))
+    if entry_price is None or entry_price <= 0:
+        raise RuntimeError("Precio de entrada invalido para ejecucion live.")
+
+    usd_entry = shares * entry_price
+    if usd_entry > max_usd_per_trade:
+        raise RuntimeError(
+            f"USD entrada excede maximo permitido ({usd_entry:.2f} > {max_usd_per_trade:.2f})."
+        )
+
+    target_exit_price = parse_float(str(context.get("target_exit_price_value")))
+    if target_exit_price is None:
+        target_exit_price = parse_float(str(context.get("target_exit_price")))
+    if target_exit_price is None or target_exit_price <= 0:
+        raise RuntimeError("Precio limit de salida invalido.")
+
+    signed_market_order = client.create_market_order(
+        MarketOrderArgs(
+            token_id=entry_token_id,
+            amount=usd_entry,
+            side="BUY",
+            order_type=OrderType.FOK,
+        )
+    )
+    entry_response = client.post_order(signed_market_order, orderType=OrderType.FOK)
+    entry_order_id = extract_order_id(entry_response)
+    entry_tx_hash = extract_tx_hash(entry_response)
+    if not entry_order_id:
+        raise RuntimeError("CLOB no devolvio ID de orden para la entrada market.")
+
+    entry_order_status_payload = wait_for_entry_order_result(
+        client,
+        entry_order_id,
+        timeout_seconds=DEFAULT_ENTRY_ORDER_WAIT_SECONDS,
+        poll_seconds=1,
+    )
+    if entry_order_status_payload is None:
+        raise RuntimeError(
+            "No se pudo confirmar el estado de la orden de entrada. "
+            "No se envia orden limit de salida."
+        )
+
+    if is_order_terminal_without_fill(entry_order_status_payload):
+        reason = extract_order_status_text(entry_order_status_payload) or "estado terminal"
+        raise RuntimeError(
+            f"Orden de entrada no ejecutada ({reason}). No se envia orden de salida."
+        )
+
+    filled_size = extract_filled_size(entry_order_status_payload)
+    if not is_order_filled(entry_order_status_payload) and (
+        filled_size is None or filled_size <= 0
+    ):
+        raise RuntimeError(
+            "Entrada market sin fill confirmado. No se envia orden limit de salida."
+        )
+
+    exit_size = float(shares)
+    if filled_size is not None and filled_size > 0:
+        exit_size = filled_size
+
+    signed_exit_order = client.create_order(
+        OrderArgs(
+            token_id=entry_token_id,
+            price=target_exit_price,
+            size=exit_size,
+            side="SELL",
+        )
+    )
+    exit_response = client.post_order(signed_exit_order, orderType=OrderType.GTC)
+    exit_order_id = extract_order_id(exit_response)
+    exit_tx_hash = extract_tx_hash(exit_response)
+
+    executed_at = datetime.now(timezone.utc)
+    context["target_profile_name"] = option_name
+    context["entry_order_id"] = entry_order_id
+    context["entry_tx_hash"] = entry_tx_hash
+    context["exit_order_id"] = exit_order_id
+    context["exit_tx_hash"] = exit_tx_hash
+    context["entry_status"] = (
+        extract_order_status_text(entry_order_status_payload)
+        or ("filled" if is_order_filled(entry_order_status_payload) else "N/D")
+    )
+    context["entry_filled_size"] = format_optional_decimal(filled_size, decimals=4)
+    context["entry_filled_size_value"] = filled_size
+    context["exit_size"] = format_optional_decimal(exit_size, decimals=4)
+    context["exit_size_value"] = exit_size
+    context["wallet_address"] = wallet_address
+    context["wallet_history_url"] = wallet_history_url
+    context["entry_price"] = format_optional_decimal(entry_price, decimals=3)
+    context["entry_price_value"] = entry_price
+    context["shares"] = shares
+    context["shares_value"] = shares
+    context["usd_entry"] = format_optional_decimal(usd_entry, decimals=2)
+    context["usd_entry_value"] = usd_entry
+    context["executed_at_utc"] = executed_at.isoformat()
+    context["executed_at_local"] = dt_to_local_hhmm(executed_at)
+    context["order_entry_raw"] = entry_response
+    context["order_entry_status_raw"] = entry_order_status_payload
+    context["order_exit_raw"] = exit_response
+    context["balance_after_entry"] = fetch_wallet_usdc_balance(client, signature_type)
+    return context
+
+
+async def live_exit_monitor_loop(
+    client: ClobClient,
+    active_live_trades: Dict[str, Dict[str, object]],
+    trades_state_path: str,
+    token: str,
+    parse_mode: str,
+    signature_type: int,
+    poll_seconds: int,
+):
+    poll_interval = max(3, poll_seconds)
+    while True:
+        trade_ids = list(active_live_trades.keys())
+        for trade_id in trade_ids:
+            trade = active_live_trades.get(trade_id)
+            if not isinstance(trade, dict):
+                continue
+            exit_order_id = str(trade.get("exit_order_id", "") or "")
+            if not exit_order_id:
+                continue
+            try:
+                order_payload = await asyncio.to_thread(client.get_order, exit_order_id)
+            except Exception:
+                continue
+
+            chat_id = str(trade.get("chat_id", "") or "")
+            if not chat_id:
+                continue
+
+            if is_order_filled(order_payload):
+                balance_after_close = await asyncio.to_thread(
+                    fetch_wallet_usdc_balance, client, signature_type
+                )
+                message = build_live_close_success_message(trade, balance_after_close)
+                send_telegram(token, chat_id, message, parse_mode=parse_mode)
+                active_live_trades.pop(trade_id, None)
+                save_live_trades_state(trades_state_path, active_live_trades)
+                continue
+
+            if is_order_terminal_without_fill(order_payload):
+                reason = extract_order_status_text(order_payload) or "estado terminal"
+                balance_after_close = await asyncio.to_thread(
+                    fetch_wallet_usdc_balance, client, signature_type
+                )
+                message = build_live_close_loss_message(trade, balance_after_close, reason)
+                send_telegram(token, chat_id, message, parse_mode=parse_mode)
+                active_live_trades.pop(trade_id, None)
+                save_live_trades_state(trades_state_path, active_live_trades)
+                continue
+
+        await asyncio.sleep(poll_interval)
+
 async def command_loop(
     env: Dict[str, str],
     prices: Dict[str, Tuple[float, datetime]],
     presets_by_key: Dict[str, MonitorPreset],
     preview_registry: Dict[str, Dict[str, object]],
+    trading_runtime: Dict[str, object],
+    active_live_trades: Dict[str, Dict[str, object]],
 ):
     token = env.get("BOT_TOKEN", "")
     parse_mode = env.get("TELEGRAM_PARSE_MODE", "HTML")
@@ -253,6 +806,15 @@ async def command_loop(
         max_live_price_age_seconds = DEFAULT_MAX_LIVE_PRICE_AGE_SECONDS
     max_live_price_age_seconds = max(1, max_live_price_age_seconds)
     allowed_chat_ids = set(parse_chat_ids(env))
+    trading_mode = normalize_trading_mode(str(trading_runtime.get("mode") or "preview"))
+    live_enabled = bool(trading_runtime.get("live_enabled"))
+    live_client = trading_runtime.get("client")
+    signature_type = int(trading_runtime.get("signature_type") or 2)
+    max_shares_per_trade = int(trading_runtime.get("max_shares_per_trade") or 6)
+    max_usd_per_trade = float(trading_runtime.get("max_usd_per_trade") or 25.0)
+    wallet_address = str(trading_runtime.get("wallet_address") or "")
+    wallet_history_url = str(trading_runtime.get("wallet_history_url") or "")
+    trades_state_path = str(trading_runtime.get("trades_state_path") or LIVE_TRADES_STATE_PATH)
     preview_template = load_template(
         PREVIEW_TEMPLATE_PATH,
         default_template=DEFAULT_PREVIEW_TEMPLATE,
@@ -302,38 +864,106 @@ async def command_loop(
 
                 if callback_data.startswith(PREVIEW_CALLBACK_PREFIX):
                     preview_id, target_code = parse_preview_callback_data(callback_data)
-                    preview_context = preview_registry.get(preview_id)
+                    preview_context = preview_registry.pop(preview_id, None)
                     if preview_context is None:
                         if callback_id:
                             answer_callback_query(
                                 token,
                                 str(callback_id),
-                                text="Preview expirada o no disponible.",
+                                text="Preview expirada o ya utilizada.",
                                 show_alert=False,
                             )
                         continue
 
-                    _, option_name = apply_preview_target_to_context(preview_context, target_code)
-                    if callback_id:
-                        answer_callback_query(
-                            token,
-                            str(callback_id),
-                            text=f"Seleccionado: {option_name} (preview).",
-                            show_alert=False,
-                        )
-
-                    if callback_chat_id is not None:
-                        confirmation = build_preview_selection_message(
-                            preview_context,
-                            target_code,
-                        )
-                        send_telegram(
+                    callback_message_id = parse_int(str(callback_message.get("message_id")))
+                    if callback_chat_id is not None and callback_message_id is not None:
+                        clear_inline_keyboard(
                             token,
                             str(callback_chat_id),
-                            confirmation,
-                            parse_mode=parse_mode,
+                            callback_message_id,
                         )
-                    preview_registry.pop(preview_id, None)
+
+                    if (
+                        trading_mode == "live"
+                        and live_enabled
+                        and isinstance(live_client, ClobClient)
+                    ):
+                        try:
+                            live_trade = await asyncio.to_thread(
+                                execute_live_trade_from_preview,
+                                live_client,
+                                preview_context,
+                                target_code,
+                                signature_type,
+                                max_shares_per_trade,
+                                max_usd_per_trade,
+                                wallet_address,
+                                wallet_history_url,
+                            )
+                        except Exception as exc:
+                            if callback_id:
+                                answer_callback_query(
+                                    token,
+                                    str(callback_id),
+                                    text="Fallo ejecucion live.",
+                                    show_alert=True,
+                                )
+                            if callback_chat_id is not None:
+                                send_telegram(
+                                    token,
+                                    str(callback_chat_id),
+                                    (
+                                        "<b>Error en ejecucion live</b>\n"
+                                        f"Detalle: {exc}\n"
+                                        "<i>No se creo la orden.</i>"
+                                    ),
+                                    parse_mode=parse_mode,
+                                )
+                        else:
+                            trade_id = f"{preview_id}-{int(datetime.now(timezone.utc).timestamp())}"
+                            live_trade["trade_id"] = trade_id
+                            live_trade["chat_id"] = str(callback_chat_id)
+                            active_live_trades[trade_id] = live_trade
+                            save_live_trades_state(trades_state_path, active_live_trades)
+
+                            if callback_id:
+                                answer_callback_query(
+                                    token,
+                                    str(callback_id),
+                                    text="Operacion live enviada.",
+                                    show_alert=False,
+                                )
+                            if callback_chat_id is not None:
+                                send_telegram(
+                                    token,
+                                    str(callback_chat_id),
+                                    build_live_entry_message(
+                                        live_trade,
+                                        normalize_usdc_balance(live_trade.get("balance_after_entry")),
+                                    ),
+                                    parse_mode=parse_mode,
+                                )
+                    else:
+                        _, option_name = apply_preview_target_to_context(preview_context, target_code)
+                        if callback_id:
+                            answer_callback_query(
+                                token,
+                                str(callback_id),
+                                text=f"Seleccionado: {option_name} (preview).",
+                                show_alert=False,
+                            )
+
+                        if callback_chat_id is not None:
+                            confirmation = build_preview_selection_message(
+                                preview_context,
+                                target_code,
+                            )
+                            send_telegram(
+                                token,
+                                str(callback_chat_id),
+                                confirmation,
+                                parse_mode=parse_mode,
+                            )
                 else:
                     if callback_id:
                         answer_callback_query(
@@ -373,7 +1003,7 @@ async def command_loop(
                 send_telegram(
                     token,
                     str(chat_id),
-                    build_help_message(),
+                    build_help_message(trading_mode),
                     parse_mode=parse_mode,
                 )
                 continue
@@ -494,6 +1124,7 @@ async def command_loop(
                     operation_preview_entry_price=operation_preview_entry_price,
                     operation_preview_target_profit_pct=operation_preview_target_profit_pct,
                 )
+                preview_data = decorate_preview_payload_for_mode(preview_data, trading_mode)
                 preview_message = build_message(preview_template, preview_data)
                 preview_id = build_preview_id(
                     preset,
@@ -561,14 +1192,11 @@ async def command_loop(
                 preview_data["entry_price_source"] = "manual_command"
                 preview_data["shares"] = int(manual_preview["shares"])
                 preview_data["shares_value"] = int(manual_preview["shares"])
-                preview_data["preview_footer"] = (
-                    "Preview manual: no ejecuta ordenes reales hasta modo live."
-                )
                 preview_data, _ = apply_preview_target_to_context(
                     preview_data,
                     str(manual_preview["target_code"]),
                 )
-
+                preview_data = decorate_preview_payload_for_mode(preview_data, trading_mode)
                 preview_message = build_message(preview_template, preview_data)
                 preview_id = build_preview_id(
                     preset,
@@ -626,6 +1254,24 @@ async def alert_loop():
     if operation_preview_target_profit_pct is None:
         operation_preview_target_profit_pct = DEFAULT_OPERATION_PREVIEW_TARGET_PROFIT_PCT
     operation_preview_target_profit_pct = max(0.0, operation_preview_target_profit_pct)
+    configured_trading_mode = normalize_trading_mode(env.get("TRADING_MODE"))
+    legacy_live_enabled = parse_bool(env.get("POLYMARKET_ENABLE_TRADING"), default=False)
+    live_trading_enabled = parse_bool(
+        env.get("LIVE_TRADING_ENABLED"),
+        default=legacy_live_enabled,
+    )
+    max_shares_per_trade = parse_int(env.get("MAX_SHARES_PER_TRADE"))
+    if max_shares_per_trade is None:
+        max_shares_per_trade = 10
+    max_shares_per_trade = max(1, max_shares_per_trade)
+    max_usd_per_trade = parse_float(env.get("MAX_USD_PER_TRADE"))
+    if max_usd_per_trade is None:
+        max_usd_per_trade = 25.0
+    max_usd_per_trade = max(1.0, max_usd_per_trade)
+    order_monitor_poll_seconds = parse_int(env.get("ORDER_MONITOR_POLL_SECONDS"))
+    if order_monitor_poll_seconds is None:
+        order_monitor_poll_seconds = DEFAULT_ORDER_MONITOR_POLL_SECONDS
+    order_monitor_poll_seconds = max(3, order_monitor_poll_seconds)
     rtds_use_proxy = parse_bool(env.get("RTDS_USE_PROXY"), default=True)
     proxy_url = env.get("PROXY_URL", "").strip()
 
@@ -634,6 +1280,37 @@ async def alert_loop():
     if not token or not chat_ids:
         print("Faltan BOT_TOKEN o CHAT_ID/CHAT_IDS en alerts/.env")
         return
+
+    wallet_address = env.get("POLYMARKET_WALLET_ADDRESS", "").strip()
+    if not wallet_address:
+        wallet_address = env.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
+    wallet_history_url = build_wallet_history_url(wallet_address)
+
+    live_client: Optional[ClobClient] = None
+    signature_type_live = parse_int(env.get("POLYMARKET_SIGNATURE_TYPE"))
+    if signature_type_live is None:
+        signature_type_live = 2
+    trading_mode = "preview"
+    if configured_trading_mode == "live" and live_trading_enabled:
+        live_client, live_note, signature_type_live = init_trading_client(env)
+        print(live_note)
+        if isinstance(live_client, ClobClient):
+            trading_mode = "live"
+        else:
+            print("Fase 3 live no disponible; fallback automatico a preview.")
+    elif configured_trading_mode == "live" and not live_trading_enabled:
+        print(
+            "TRADING_MODE=live pero LIVE_TRADING_ENABLED=0; "
+            "se mantiene solo preview."
+        )
+    else:
+        print("Modo trading preview activo (sin ordenes reales).")
+    print(f"Modo operativo efectivo: {trading_mode}.")
+    if configured_trading_mode != trading_mode:
+        print(
+            f"Modo configurado: {configured_trading_mode}. "
+            f"Aplicado: {trading_mode}."
+        )
 
     startup_message = env.get("STARTUP_MESSAGE", "").strip()
     if not startup_message:
@@ -660,13 +1337,48 @@ async def alert_loop():
     target_symbols = {norm_symbol(f"{p.symbol}/USD") for p in presets}
     prices: Dict[str, Tuple[float, datetime]] = {}
     preview_registry: Dict[str, Dict[str, object]] = {}
+    active_live_trades: Dict[str, Dict[str, object]] = load_live_trades_state(LIVE_TRADES_STATE_PATH)
+    trading_runtime: Dict[str, object] = {
+        "mode": trading_mode,
+        "live_enabled": trading_mode == "live",
+        "client": live_client,
+        "signature_type": signature_type_live,
+        "max_shares_per_trade": max_shares_per_trade,
+        "max_usd_per_trade": max_usd_per_trade,
+        "wallet_address": wallet_address,
+        "wallet_history_url": wallet_history_url,
+        "trades_state_path": LIVE_TRADES_STATE_PATH,
+    }
 
     price_task = asyncio.create_task(
         rtds_price_loop(prices, target_symbols, use_proxy=rtds_use_proxy)
     )
     command_task = asyncio.create_task(
-        command_loop(env, prices, presets_by_key, preview_registry)
+        command_loop(
+            env,
+            prices,
+            presets_by_key,
+            preview_registry,
+            trading_runtime,
+            active_live_trades,
+        )
     )
+    live_monitor_task: Optional[asyncio.Task] = None
+    if (
+        trading_mode == "live"
+        and isinstance(live_client, ClobClient)
+    ):
+        live_monitor_task = asyncio.create_task(
+            live_exit_monitor_loop(
+                live_client,
+                active_live_trades,
+                LIVE_TRADES_STATE_PATH,
+                token,
+                parse_mode,
+                signature_type_live,
+                order_monitor_poll_seconds,
+            )
+        )
 
     try:
         while True:
@@ -941,6 +1653,7 @@ async def alert_loop():
                         operation_preview_entry_price=operation_preview_entry_price,
                         operation_preview_target_profit_pct=operation_preview_target_profit_pct,
                     )
+                    preview_data = decorate_preview_payload_for_mode(preview_data, trading_mode)
                     preview_message = build_message(preview_template, preview_data)
                     preview_id = build_preview_id(preset, w_start)
                     preview_registry[preview_id] = preview_data
@@ -985,6 +1698,8 @@ async def alert_loop():
     finally:
         price_task.cancel()
         command_task.cancel()
+        if live_monitor_task is not None:
+            live_monitor_task.cancel()
         for chat_id in chat_ids:
             send_telegram(token, chat_id, shutdown_message, parse_mode=parse_mode)
 
