@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import html
 import time
 
 from bot.core_utils import *
@@ -41,6 +42,9 @@ DEFAULT_TRADING_MODE = "preview"
 DEFAULT_ORDER_MONITOR_POLL_SECONDS = 10
 DEFAULT_ORDER_MONITOR_RETRY_SECONDS = 30
 DEFAULT_ENTRY_ORDER_WAIT_SECONDS = 8
+DEFAULT_EXIT_LIMIT_MAX_RETRIES = 3
+DEFAULT_EXIT_LIMIT_RETRY_SECONDS = 1.0
+DEFAULT_EXIT_ORDER_VERIFY_SECONDS = 4
 
 
 def resolve_preview_target_code(raw_code: Optional[str]) -> str:
@@ -257,6 +261,27 @@ def normalize_trading_mode(raw_mode: Optional[str]) -> str:
     if mode in ("preview", "live"):
         return mode
     return DEFAULT_TRADING_MODE
+
+
+def build_callback_user_label(callback_query: Dict[str, object]) -> str:
+    actor = callback_query.get("from")
+    if isinstance(actor, dict):
+        username = str(actor.get("username") or "").strip()
+        first_name = str(actor.get("first_name") or "").strip()
+        last_name = str(actor.get("last_name") or "").strip()
+        full_name = " ".join([p for p in (first_name, last_name) if p]).strip()
+        user_id = actor.get("id")
+        if username:
+            return f"@{username}"
+        if full_name:
+            return full_name
+        if user_id is not None:
+            return f"id:{user_id}"
+    return "desconocido"
+
+
+def escape_html_text(value: object) -> str:
+    return html.escape(str(value), quote=False)
 
 
 def decorate_preview_payload_for_mode(
@@ -509,6 +534,93 @@ def wait_for_entry_order_result(
     return last_payload
 
 
+def probe_order_status(
+    client: ClobClient,
+    order_id: str,
+    timeout_seconds: int = DEFAULT_EXIT_ORDER_VERIFY_SECONDS,
+    poll_seconds: int = 1,
+) -> Optional[Dict[str, object]]:
+    order_id_text = str(order_id).strip()
+    if not order_id_text:
+        return None
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    sleep_for = max(1, poll_seconds)
+    last_payload: Optional[Dict[str, object]] = None
+    while time.monotonic() <= deadline:
+        try:
+            payload = client.get_order(order_id_text)
+            if isinstance(payload, dict):
+                last_payload = payload
+                status = extract_order_status_text(payload)
+                if status or is_order_filled(payload) or is_order_terminal_without_fill(payload):
+                    return payload
+        except Exception:
+            pass
+        time.sleep(sleep_for)
+    return last_payload
+
+
+def place_exit_limit_order_with_retries(
+    client: ClobClient,
+    token_id: str,
+    price: float,
+    size: float,
+    max_attempts: int,
+    retry_seconds: float,
+) -> Tuple[Dict[str, object], str, str, Optional[Dict[str, object]], int]:
+    attempts = max(1, int(max_attempts))
+    pause = max(0.2, float(retry_seconds))
+    last_error = "sin detalle"
+
+    for attempt in range(1, attempts + 1):
+        try:
+            signed_exit_order = client.create_order(
+                OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    size=size,
+                    side="SELL",
+                )
+            )
+            exit_response = client.post_order(signed_exit_order, orderType=OrderType.GTC)
+            exit_order_id = extract_order_id(exit_response)
+            exit_tx_hash = extract_tx_hash(exit_response)
+
+            if not exit_order_id:
+                last_error = "CLOB no devolvio order_id para salida limit."
+            else:
+                status_payload = probe_order_status(
+                    client,
+                    exit_order_id,
+                    timeout_seconds=DEFAULT_EXIT_ORDER_VERIFY_SECONDS,
+                    poll_seconds=1,
+                )
+                if status_payload is not None and is_order_terminal_without_fill(status_payload):
+                    status_label = extract_order_status_text(status_payload) or "estado terminal"
+                    last_error = (
+                        f"orden salida {exit_order_id} en estado terminal ({status_label})"
+                    )
+                else:
+                    return (
+                        exit_response,
+                        exit_order_id,
+                        exit_tx_hash,
+                        status_payload,
+                        attempt,
+                    )
+        except Exception as exc:
+            last_error = str(exc)
+
+        if attempt < attempts:
+            time.sleep(pause)
+
+    raise RuntimeError(
+        "No esta dejando vender "
+        f"{size:,.4f} shares al limit {price:.3f} "
+        f"tras {attempts} intentos. Ultimo error: {last_error}"
+    )
+
+
 def build_live_entry_message(
     trade_record: Dict[str, object],
     balance_after_entry: Optional[float],
@@ -533,6 +645,9 @@ def build_live_entry_message(
     exit_order_id = str(trade_record.get("exit_order_id", "") or "")
     if exit_order_id:
         lines.append(f"Order salida ID: {exit_order_id}")
+    exit_order_attempts = parse_int(str(trade_record.get("exit_order_attempts")))
+    if exit_order_attempts is not None and exit_order_attempts > 1:
+        lines.append(f"Reintentos salida limit: {exit_order_attempts}")
     entry_tx_hash = str(trade_record.get("entry_tx_hash", "") or "")
     if entry_tx_hash:
         lines.append(f"Tx entrada: {entry_tx_hash}")
@@ -592,6 +707,8 @@ def execute_live_trade_from_preview(
     max_usd_per_trade: float,
     wallet_address: str,
     wallet_history_url: str,
+    exit_limit_max_retries: int,
+    exit_limit_retry_seconds: float,
 ) -> Dict[str, object]:
     context, option_name = apply_preview_target_to_context(preview_context, target_code)
     entry_token_id = str(context.get("entry_token_id", "")).strip()
@@ -670,17 +787,20 @@ def execute_live_trade_from_preview(
     if filled_size is not None and filled_size > 0:
         exit_size = filled_size
 
-    signed_exit_order = client.create_order(
-        OrderArgs(
-            token_id=entry_token_id,
-            price=target_exit_price,
-            size=exit_size,
-            side="SELL",
-        )
+    (
+        exit_response,
+        exit_order_id,
+        exit_tx_hash,
+        exit_order_status_payload,
+        exit_order_attempts,
+    ) = place_exit_limit_order_with_retries(
+        client=client,
+        token_id=entry_token_id,
+        price=target_exit_price,
+        size=exit_size,
+        max_attempts=exit_limit_max_retries,
+        retry_seconds=exit_limit_retry_seconds,
     )
-    exit_response = client.post_order(signed_exit_order, orderType=OrderType.GTC)
-    exit_order_id = extract_order_id(exit_response)
-    exit_tx_hash = extract_tx_hash(exit_response)
 
     executed_at = datetime.now(timezone.utc)
     context["target_profile_name"] = option_name
@@ -688,6 +808,12 @@ def execute_live_trade_from_preview(
     context["entry_tx_hash"] = entry_tx_hash
     context["exit_order_id"] = exit_order_id
     context["exit_tx_hash"] = exit_tx_hash
+    context["exit_order_attempts"] = exit_order_attempts
+    context["exit_order_status"] = (
+        extract_order_status_text(exit_order_status_payload)
+        if exit_order_status_payload is not None
+        else ""
+    )
     context["entry_status"] = (
         extract_order_status_text(entry_order_status_payload)
         or ("filled" if is_order_filled(entry_order_status_payload) else "N/D")
@@ -709,6 +835,7 @@ def execute_live_trade_from_preview(
     context["order_entry_raw"] = entry_response
     context["order_entry_status_raw"] = entry_order_status_payload
     context["order_exit_raw"] = exit_response
+    context["order_exit_status_raw"] = exit_order_status_payload
     context["balance_after_entry"] = fetch_wallet_usdc_balance(client, signature_type)
     return context
 
@@ -812,6 +939,12 @@ async def command_loop(
     signature_type = int(trading_runtime.get("signature_type") or 2)
     max_shares_per_trade = int(trading_runtime.get("max_shares_per_trade") or 6)
     max_usd_per_trade = float(trading_runtime.get("max_usd_per_trade") or 25.0)
+    exit_limit_max_retries = int(
+        trading_runtime.get("exit_limit_max_retries") or DEFAULT_EXIT_LIMIT_MAX_RETRIES
+    )
+    exit_limit_retry_seconds = float(
+        trading_runtime.get("exit_limit_retry_seconds") or DEFAULT_EXIT_LIMIT_RETRY_SECONDS
+    )
     wallet_address = str(trading_runtime.get("wallet_address") or "")
     wallet_history_url = str(trading_runtime.get("wallet_history_url") or "")
     trades_state_path = str(trading_runtime.get("trades_state_path") or LIVE_TRADES_STATE_PATH)
@@ -883,6 +1016,24 @@ async def command_loop(
                             callback_message_id,
                         )
 
+                    selected_option = PREVIEW_TARGET_OPTIONS.get(
+                        resolve_preview_target_code(target_code),
+                        PREVIEW_TARGET_OPTIONS[DEFAULT_PREVIEW_TARGET_CODE],
+                    )
+                    selected_option_name = str(selected_option.get("name", "N/D"))
+                    selected_user = build_callback_user_label(callback_query)
+                    if callback_chat_id is not None:
+                        send_telegram(
+                            token,
+                            str(callback_chat_id),
+                            (
+                                "<b>Seleccion recibida</b>\n"
+                                f"Se selecciono {escape_html_text(selected_option_name)} "
+                                f"por el usuario {escape_html_text(selected_user)}."
+                            ),
+                            parse_mode=parse_mode,
+                        )
+
                     if (
                         trading_mode == "live"
                         and live_enabled
@@ -899,6 +1050,8 @@ async def command_loop(
                                 max_usd_per_trade,
                                 wallet_address,
                                 wallet_history_url,
+                                exit_limit_max_retries,
+                                exit_limit_retry_seconds,
                             )
                         except Exception as exc:
                             if callback_id:
@@ -915,7 +1068,7 @@ async def command_loop(
                                     (
                                         "<b>Error en ejecucion live</b>\n"
                                         f"Detalle: {exc}\n"
-                                        "<i>No se creo la orden.</i>"
+                                        "<i>Si la entrada se ejecuto, revisa y corrige salida manual.</i>"
                                     ),
                                     parse_mode=parse_mode,
                                 )
@@ -1272,6 +1425,14 @@ async def alert_loop():
     if order_monitor_poll_seconds is None:
         order_monitor_poll_seconds = DEFAULT_ORDER_MONITOR_POLL_SECONDS
     order_monitor_poll_seconds = max(3, order_monitor_poll_seconds)
+    exit_limit_max_retries = parse_int(env.get("EXIT_LIMIT_MAX_RETRIES"))
+    if exit_limit_max_retries is None:
+        exit_limit_max_retries = DEFAULT_EXIT_LIMIT_MAX_RETRIES
+    exit_limit_max_retries = max(1, exit_limit_max_retries)
+    exit_limit_retry_seconds = parse_float(env.get("EXIT_LIMIT_RETRY_SECONDS"))
+    if exit_limit_retry_seconds is None:
+        exit_limit_retry_seconds = DEFAULT_EXIT_LIMIT_RETRY_SECONDS
+    exit_limit_retry_seconds = max(0.2, exit_limit_retry_seconds)
     rtds_use_proxy = parse_bool(env.get("RTDS_USE_PROXY"), default=True)
     proxy_url = env.get("PROXY_URL", "").strip()
 
@@ -1311,6 +1472,12 @@ async def alert_loop():
             f"Modo configurado: {configured_trading_mode}. "
             f"Aplicado: {trading_mode}."
         )
+    if trading_mode == "live":
+        print(
+            "Control salida limit: "
+            f"reintentos={exit_limit_max_retries}, "
+            f"espera={exit_limit_retry_seconds:.1f}s."
+        )
 
     startup_message = env.get("STARTUP_MESSAGE", "").strip()
     if not startup_message:
@@ -1345,6 +1512,8 @@ async def alert_loop():
         "signature_type": signature_type_live,
         "max_shares_per_trade": max_shares_per_trade,
         "max_usd_per_trade": max_usd_per_trade,
+        "exit_limit_max_retries": exit_limit_max_retries,
+        "exit_limit_retry_seconds": exit_limit_retry_seconds,
         "wallet_address": wallet_address,
         "wallet_history_url": wallet_history_url,
         "trades_state_path": LIVE_TRADES_STATE_PATH,
