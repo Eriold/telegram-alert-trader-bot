@@ -60,6 +60,11 @@ MAX_GAMMA_WINDOW_DRIFT_SECONDS = 120
 DEFAULT_MAX_LIVE_PRICE_AGE_SECONDS = 30
 DEFAULT_WS_RECONNECT_BASE_SECONDS = 2.0
 DEFAULT_WS_RECONNECT_MAX_SECONDS = 20.0
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_SYMBOL_BY_CRYPTO: Dict[str, str] = {
+    "ETH": "ETHUSDT",
+    "BTC": "BTCUSDT",
+}
 DB_READ_ERRORS_SEEN: Set[Tuple[str, str]] = set()
 DB_WRITE_ERRORS_SEEN: Set[Tuple[str, str]] = set()
 STATUS_HISTORY_CACHE: Dict[str, Dict[int, Dict[str, object]]] = {}
@@ -587,6 +592,7 @@ def fetch_recent_directions_via_api(
             w_end,
             retries=max(1, retries_per_window),
             allow_last_read_fallback=False,
+            allow_external_price_fallback=False,
         )
         if row is None:
             # Do not skip windows: streak requires contiguous closed sessions.
@@ -633,7 +639,11 @@ def count_consecutive_directions(
 
 
 def fetch_recent_closed_rows_via_api(
-    preset: MonitorPreset, current_start: datetime, limit: int = 3, max_attempts: int = 12
+    preset: MonitorPreset,
+    current_start: datetime,
+    limit: int = 3,
+    max_attempts: int = 12,
+    retries_per_window: int = 1,
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     offset = 1
@@ -641,24 +651,15 @@ def fetch_recent_closed_rows_via_api(
     while len(rows) < limit and attempts < max_attempts:
         w_start = current_start - timedelta(seconds=offset * preset.window_seconds)
         w_end = w_start + timedelta(seconds=preset.window_seconds)
-        try:
-            o, c, _, _ = get_poly_open_close(
-                w_start, w_end, preset.symbol, preset.variant
-            )
-        except Exception:
-            attempts += 1
-            offset += 1
-            continue
-        if o is not None and c is not None:
-            rows.append(
-                {
-                    "open": o,
-                    "close": c,
-                    "delta": c - o,
-                    "window_start": w_start,
-                    "window_end": w_end,
-                }
-            )
+        row = fetch_closed_row_for_window_via_api(
+            preset,
+            w_start,
+            w_end,
+            retries=max(1, retries_per_window),
+            allow_last_read_fallback=True,
+        )
+        if row is not None:
+            rows.append(row)
         attempts += 1
         offset += 1
     return rows
@@ -765,12 +766,67 @@ def normalize_history_row(
     }
 
 
+def fetch_closed_row_for_window_via_binance(
+    preset: MonitorPreset,
+    window_start: datetime,
+    window_end: datetime,
+) -> Optional[Dict[str, object]]:
+    symbol = BINANCE_SYMBOL_BY_CRYPTO.get(preset.symbol.upper())
+    if not symbol:
+        return None
+    params = {
+        "symbol": symbol,
+        "interval": "1m",
+        "startTime": int(window_start.timestamp() * 1000),
+        "endTime": int(window_end.timestamp() * 1000),
+        "limit": 1000,
+    }
+    try:
+        resp = HTTP.get(BINANCE_KLINES_URL, params=params, timeout=10)
+        if resp.status_code >= 400:
+            return None
+        payload = resp.json() or []
+        if not isinstance(payload, list) or not payload:
+            return None
+        first = payload[0]
+        last = payload[-1]
+        open_value = (
+            parse_float(str(first[1]))
+            if isinstance(first, list) and len(first) > 1
+            else None
+        )
+        close_value = (
+            parse_float(str(last[4]))
+            if isinstance(last, list) and len(last) > 4
+            else None
+        )
+        if open_value is None and close_value is None:
+            return None
+        delta_value: Optional[float] = None
+        if open_value is not None and close_value is not None:
+            delta_value = close_value - open_value
+        return {
+            "open": open_value,
+            "close": close_value,
+            "delta": delta_value,
+            "window_start": window_start,
+            "window_end": window_end,
+            "open_estimated": True,
+            "close_estimated": True,
+            "close_from_last_read": False,
+            "delta_estimated": True,
+        }
+    except Exception:
+        return None
+
+
 def fetch_closed_row_for_window_via_api(
     preset: MonitorPreset,
     window_start: datetime,
     window_end: datetime,
     retries: int,
     allow_last_read_fallback: bool = True,
+    allow_external_price_fallback: bool = True,
 ) -> Optional[Dict[str, object]]:
     attempts = max(1, retries)
     variants: List[Optional[str]] = [preset.variant]
@@ -782,6 +838,7 @@ def fetch_closed_row_for_window_via_api(
         )
     open_value: Optional[float] = None
     close_value: Optional[float] = None
+    open_estimated = False
 
     for _ in range(attempts):
         for variant in variants:
@@ -810,6 +867,23 @@ def fetch_closed_row_for_window_via_api(
         close_estimated = True
         close_from_last_read = True
 
+    if allow_external_price_fallback and (open_value is None or close_value is None):
+        external_row = fetch_closed_row_for_window_via_binance(
+            preset,
+            window_start,
+            window_end,
+        )
+        if external_row is not None:
+            external_open = parse_float(external_row.get("open"))  # type: ignore[arg-type]
+            external_close = parse_float(external_row.get("close"))  # type: ignore[arg-type]
+            if open_value is None and external_open is not None:
+                open_value = external_open
+                open_estimated = True
+            if close_value is None and external_close is not None:
+                close_value = external_close
+                close_estimated = True
+                close_from_last_read = False
+
     if open_value is None and close_value is None:
         return None
 
@@ -817,7 +891,7 @@ def fetch_closed_row_for_window_via_api(
     delta_estimated = False
     if open_value is not None and close_value is not None:
         delta_value = close_value - open_value
-        if close_estimated:
+        if close_estimated or open_estimated:
             delta_estimated = True
     return {
         "open": open_value,
@@ -825,7 +899,7 @@ def fetch_closed_row_for_window_via_api(
         "delta": delta_value,
         "window_start": window_start,
         "window_end": window_end,
-        "open_estimated": False,
+        "open_estimated": open_estimated,
         "close_estimated": close_estimated,
         "close_from_last_read": close_from_last_read,
         "delta_estimated": delta_estimated,
@@ -1003,6 +1077,52 @@ def fetch_status_history_rows(
 
     backfill_history_rows(output_rows)
 
+    rows_by_epoch: Dict[int, Dict[str, object]] = {}
+    for row in output_rows:
+        start_epoch = window_epoch(row.get("window_start"))  # type: ignore[arg-type]
+        if start_epoch is None:
+            continue
+        rows_by_epoch[start_epoch] = row
+
+    with_close_count = sum(
+        1
+        for row in output_rows
+        if parse_float(row.get("close")) is not None  # type: ignore[arg-type]
+    )
+    if with_close_count < history_count:
+        extra_limit = max(history_count * 4, history_count + (history_count - with_close_count))
+        fallback_rows = fetch_recent_closed_rows_via_api(
+            preset,
+            current_window_start,
+            limit=extra_limit,
+            max_attempts=extra_limit * 3,
+            retries_per_window=max(1, api_window_retries),
+        )
+        for source_row in fallback_rows:
+            source_start = source_row.get("window_start")
+            if not isinstance(source_start, datetime):
+                continue
+            start_epoch = int(source_start.timestamp())
+            normalized = normalize_history_row(
+                source_row, source_start, preset.window_seconds
+            )
+            existing = rows_by_epoch.get(start_epoch)
+            if should_replace_cached_row(existing, normalized):
+                rows_by_epoch[start_epoch] = normalized
+
+        ordered_epochs = sorted(rows_by_epoch.keys(), reverse=True)
+        rows_with_close: List[Dict[str, object]] = []
+        rows_without_close: List[Dict[str, object]] = []
+        for start_epoch in ordered_epochs:
+            row = rows_by_epoch[start_epoch]
+            close_value = parse_float(row.get("close"))  # type: ignore[arg-type]
+            if close_value is None:
+                rows_without_close.append(row)
+            else:
+                rows_with_close.append(row)
+        output_rows = (rows_with_close + rows_without_close)[:history_count]
+        backfill_history_rows(output_rows)
+
     for row in output_rows:
         start_epoch = window_epoch(row.get("window_start"))  # type: ignore[arg-type]
         if start_epoch is None:
@@ -1040,7 +1160,7 @@ def build_status_message(
     history_rows: List[Dict[str, object]],
 ) -> str:
     title = (
-        f"Resultados para las ultimas {len(history_rows)} sesiones de "
+        f"Resultados para las ultimas {len(history_rows)} sesiones disponibles de "
         f"{preset.symbol} ({preset.timeframe_display})"
     )
     lines = [title]
