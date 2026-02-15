@@ -19,19 +19,19 @@ DEFAULT_PREVIEW_TARGET_CODE = "tp80"
 PREVIEW_TARGET_OPTIONS: Dict[str, Dict[str, object]] = {
     "tp70": {
         "button": "🟢 Salir 70%",
-        "name": "TP 70%",
-        "kind": "pct",
-        "value": 70.0,
+        "name": "Salida fija 0.70",
+        "kind": "price",
+        "value": 0.70,
     },
     "tp80": {
         "button": "🟡 Salir 80%",
-        "name": "TP 80%",
-        "kind": "pct",
-        "value": 80.0,
+        "name": "Salida fija 0.80",
+        "kind": "price",
+        "value": 0.80,
     },
     "tp99": {
         "button": "🔵 Venc. 0.99",
-        "name": "Vencimiento 0.99",
+        "name": "Salida fija 0.99",
         "kind": "price",
         "value": 0.99,
     },
@@ -48,6 +48,7 @@ DEFAULT_EXIT_ORDER_VERIFY_SECONDS = 4
 EXIT_LIMIT_FAILURE_TAG = "[EXIT_LIMIT_RETRY_FAILED]"
 DEFAULT_ENTRY_TOKEN_RESOLVE_WAIT_SECONDS = 30
 DEFAULT_ENTRY_TOKEN_RESOLVE_POLL_SECONDS = 2.0
+DEFAULT_MAX_MARKET_ENTRY_PRICE = 0.56
 
 
 def resolve_preview_target_code(raw_code: Optional[str]) -> str:
@@ -197,7 +198,7 @@ def build_help_message(trading_mode: str) -> str:
         "<code>/preview-eth1h</code> -> Crea preview de operacion ETH 1h\n"
         "<code>/preview-btc15m</code> -> Crea preview de operacion BTC 15m\n"
         "<code>/preview-btc1h</code> -> Crea preview de operacion BTC 1h\n"
-        "Botones de salida disponibles en cada preview: <code>70%</code>, <code>80%</code>, <code>0.99</code>\n\n"
+        "Botones de salida fija en cada preview: <code>0.70</code>, <code>0.80</code>, <code>0.99</code>\n\n"
         "<b>Preview manual</b>\n"
         "<code>/eth15m-B-sha-10-V-0.50</code> -> Ejemplo compra YES manual\n"
         "<code>/btc1h-S-sha-6-V-0.45-tp-70</code> -> Ejemplo compra NO manual con TP 70\n\n"
@@ -207,7 +208,7 @@ def build_help_message(trading_mode: str) -> str:
         "<code>{lado}</code> = B (YES) | S (NO)\n"
         "<code>{shares}</code> = cantidad de shares\n"
         "<code>{precio}</code> = precio estimado de entrada (0.01 a 0.99)\n"
-        "<code>{tp}</code> = objetivo de salida opcional\n\n"
+        "<code>{tp}</code> = salida fija opcional: 70->0.70, 80->0.80, 99->0.99\n\n"
         "<b>Ayuda</b>\n"
         "<code>/help</code> -> Muestra esta guia\n\n"
         f"<i>Modo actual: {mode_label}. {mode_note}</i>"
@@ -769,6 +770,37 @@ def build_live_entry_message(
     trade_record: Dict[str, object],
     balance_after_entry: Optional[float],
 ) -> str:
+    trade_stage = str(trade_record.get("trade_stage", "") or "")
+    if trade_stage == "ENTRY_PENDING_LIMIT":
+        lines = [
+            "<b>⏳ Entrada pendiente (LIVE)</b>",
+            f"Hora: {trade_record.get('executed_at_local', 'N/D')} COL",
+            f"Wallet: {trade_record.get('wallet_address', 'N/D')}",
+            f"Operacion: {trade_record.get('operation_pattern', 'N/D')} en {trade_record.get('market_key', 'N/D')}",
+            (
+                "Entrada market bloqueada: precio detectado "
+                f"{trade_record.get('entry_market_price_seen', 'N/D')} > "
+                f"maximo {trade_record.get('max_market_entry_price', 'N/D')}"
+            ),
+            f"BUY limit enviado a: {trade_record.get('entry_price', 'N/D')}",
+            f"Shares: {trade_record.get('shares', 'N/D')}",
+            f"USD entrada objetivo: {trade_record.get('usd_entry', 'N/D')}",
+            "Estado: pendiente de fill. Aun no se creo orden de salida.",
+        ]
+        entry_order_id = str(trade_record.get("entry_order_id", "") or "")
+        if entry_order_id:
+            lines.append(f"Order entrada ID: {entry_order_id}")
+        entry_tx_hash = str(trade_record.get("entry_tx_hash", "") or "")
+        if entry_tx_hash:
+            lines.append(f"Tx entrada: {entry_tx_hash}")
+        wallet_link = str(trade_record.get("wallet_history_url", "") or "")
+        if wallet_link:
+            lines.append(f"Link wallet: {wallet_link}")
+        if balance_after_entry is not None:
+            lines.append(f"Balance USDC (aprox): {balance_after_entry:,.2f}")
+        lines.append("<i>Requiere seguimiento manual para salida.</i>")
+        return "\n".join(lines)
+
     lines = [
         "<b>Operacion ejecutada (LIVE)</b>",
         f"Hora: {trade_record.get('executed_at_local', 'N/D')} COL",
@@ -849,6 +881,7 @@ def execute_live_trade_from_preview(
     signature_type: int,
     max_shares_per_trade: int,
     max_usd_per_trade: float,
+    max_market_entry_price: float,
     wallet_address: str,
     wallet_history_url: str,
     exit_limit_max_retries: int,
@@ -897,17 +930,97 @@ def execute_live_trade_from_preview(
     if entry_price is None or entry_price <= 0:
         raise RuntimeError("Precio de entrada invalido para ejecucion live.")
 
-    usd_entry = shares * entry_price
-    if usd_entry > max_usd_per_trade:
-        raise RuntimeError(
-            f"USD entrada excede maximo permitido ({usd_entry:.2f} > {max_usd_per_trade:.2f})."
-        )
-
     target_exit_price = parse_float(str(context.get("target_exit_price_value")))
     if target_exit_price is None:
         target_exit_price = parse_float(str(context.get("target_exit_price")))
     if target_exit_price is None or target_exit_price <= 0:
         raise RuntimeError("Precio limit de salida invalido.")
+    max_market_price = min(max(0.01, float(max_market_entry_price)), 0.99)
+    market_price_too_high = entry_price > max_market_price
+
+    context["target_profile_name"] = option_name
+    context["wallet_address"] = wallet_address
+    context["wallet_history_url"] = wallet_history_url
+    context["shares"] = shares
+    context["shares_value"] = shares
+    context["max_market_entry_price"] = format_optional_decimal(max_market_price, decimals=3)
+    context["max_market_entry_price_value"] = max_market_price
+    context["entry_market_price_seen"] = format_optional_decimal(entry_price, decimals=3)
+    context["entry_market_price_seen_value"] = entry_price
+
+    if market_price_too_high:
+        entry_limit_price = max_market_price
+        usd_entry = shares * entry_limit_price
+        if usd_entry > max_usd_per_trade:
+            raise RuntimeError(
+                f"USD entrada limite excede maximo permitido ({usd_entry:.2f} > {max_usd_per_trade:.2f})."
+            )
+
+        signed_entry_order = client.create_order(
+            OrderArgs(
+                token_id=entry_token_id,
+                price=entry_limit_price,
+                size=float(shares),
+                side="BUY",
+            )
+        )
+        entry_response = client.post_order(signed_entry_order, orderType=OrderType.GTC)
+        entry_order_id = extract_order_id(entry_response)
+        entry_tx_hash = extract_tx_hash(entry_response)
+        if not entry_order_id:
+            raise RuntimeError("CLOB no devolvio ID de orden para la entrada limit.")
+
+        entry_order_status_payload = probe_order_status(
+            client,
+            entry_order_id,
+            timeout_seconds=DEFAULT_EXIT_ORDER_VERIFY_SECONDS,
+            poll_seconds=1,
+        )
+        filled_size = extract_filled_size(entry_order_status_payload)
+        entry_status = (
+            extract_order_status_text(entry_order_status_payload)
+            if entry_order_status_payload is not None
+            else ""
+        )
+        if not entry_status:
+            entry_status = "pending"
+
+        context["entry_price_value"] = entry_limit_price
+        context["entry_price"] = format_optional_decimal(entry_limit_price, decimals=3)
+        context["entry_price_source"] = "limit_cap"
+        context, option_name = apply_preview_target_to_context(context, target_code)
+        context["target_profile_name"] = option_name
+
+        executed_at = datetime.now(timezone.utc)
+        context["trade_stage"] = "ENTRY_PENDING_LIMIT"
+        context["entry_mode"] = "LIMIT_PENDING"
+        context["entry_order_id"] = entry_order_id
+        context["entry_tx_hash"] = entry_tx_hash
+        context["entry_status"] = entry_status
+        context["entry_filled_size"] = format_optional_decimal(filled_size, decimals=4)
+        context["entry_filled_size_value"] = filled_size
+        context["exit_order_id"] = ""
+        context["exit_tx_hash"] = ""
+        context["exit_order_attempts"] = 0
+        context["exit_order_status"] = ""
+        context["exit_size"] = format_optional_decimal(float(shares), decimals=4)
+        context["exit_size_value"] = float(shares)
+        context["usd_entry"] = format_optional_decimal(usd_entry, decimals=2)
+        context["usd_entry_value"] = usd_entry
+        context["executed_at_utc"] = executed_at.isoformat()
+        context["executed_at_local"] = dt_to_local_hhmm(executed_at)
+        context["order_entry_raw"] = entry_response
+        context["order_entry_status_raw"] = entry_order_status_payload
+        context["order_exit_raw"] = {}
+        context["order_exit_status_raw"] = {}
+        context["balance_after_entry"] = fetch_wallet_usdc_balance(client, signature_type)
+        return context
+
+    usd_entry = shares * entry_price
+    if usd_entry > max_usd_per_trade:
+        raise RuntimeError(
+            f"USD entrada excede maximo permitido ({usd_entry:.2f} > {max_usd_per_trade:.2f})."
+        )
 
     signed_market_order = client.create_market_order(
         MarketOrderArgs(
@@ -969,7 +1082,8 @@ def execute_live_trade_from_preview(
     )
 
     executed_at = datetime.now(timezone.utc)
-    context["target_profile_name"] = option_name
+    context["trade_stage"] = "ENTRY_FILLED_EXIT_OPEN"
+    context["entry_mode"] = "MARKET"
     context["entry_order_id"] = entry_order_id
     context["entry_tx_hash"] = entry_tx_hash
     context["exit_order_id"] = exit_order_id
@@ -988,12 +1102,8 @@ def execute_live_trade_from_preview(
     context["entry_filled_size_value"] = filled_size
     context["exit_size"] = format_optional_decimal(exit_size, decimals=4)
     context["exit_size_value"] = exit_size
-    context["wallet_address"] = wallet_address
-    context["wallet_history_url"] = wallet_history_url
     context["entry_price"] = format_optional_decimal(entry_price, decimals=3)
     context["entry_price_value"] = entry_price
-    context["shares"] = shares
-    context["shares_value"] = shares
     context["usd_entry"] = format_optional_decimal(usd_entry, decimals=2)
     context["usd_entry_value"] = usd_entry
     context["executed_at_utc"] = executed_at.isoformat()
@@ -1105,6 +1215,10 @@ async def command_loop(
     signature_type = int(trading_runtime.get("signature_type") or 2)
     max_shares_per_trade = int(trading_runtime.get("max_shares_per_trade") or 6)
     max_usd_per_trade = float(trading_runtime.get("max_usd_per_trade") or 25.0)
+    max_market_entry_price = float(
+        trading_runtime.get("max_market_entry_price") or DEFAULT_MAX_MARKET_ENTRY_PRICE
+    )
+    max_market_entry_price = min(max(0.01, max_market_entry_price), 0.99)
     exit_limit_max_retries = int(
         trading_runtime.get("exit_limit_max_retries") or DEFAULT_EXIT_LIMIT_MAX_RETRIES
     )
@@ -1220,6 +1334,7 @@ async def command_loop(
                                 signature_type,
                                 max_shares_per_trade,
                                 max_usd_per_trade,
+                                max_market_entry_price,
                                 wallet_address,
                                 wallet_history_url,
                                 exit_limit_max_retries,
@@ -1261,19 +1376,29 @@ async def command_loop(
                                     parse_mode=parse_mode,
                                 )
                         else:
-                            trade_id = f"{preview_id}-{int(datetime.now(timezone.utc).timestamp())}"
-                            live_trade["trade_id"] = trade_id
-                            live_trade["chat_id"] = str(callback_chat_id)
-                            active_live_trades[trade_id] = live_trade
-                            save_live_trades_state(trades_state_path, active_live_trades)
+                            trade_stage = str(live_trade.get("trade_stage", "") or "")
+                            if trade_stage == "ENTRY_PENDING_LIMIT":
+                                if callback_id:
+                                    answer_callback_query(
+                                        token,
+                                        str(callback_id),
+                                        text="Entrada en limit pendiente.",
+                                        show_alert=False,
+                                    )
+                            else:
+                                trade_id = f"{preview_id}-{int(datetime.now(timezone.utc).timestamp())}"
+                                live_trade["trade_id"] = trade_id
+                                live_trade["chat_id"] = str(callback_chat_id)
+                                active_live_trades[trade_id] = live_trade
+                                save_live_trades_state(trades_state_path, active_live_trades)
 
-                            if callback_id:
-                                answer_callback_query(
-                                    token,
-                                    str(callback_id),
-                                    text="Operacion live enviada.",
-                                    show_alert=False,
-                                )
+                                if callback_id:
+                                    answer_callback_query(
+                                        token,
+                                        str(callback_id),
+                                        text="Operacion live enviada.",
+                                        show_alert=False,
+                                    )
                             if callback_chat_id is not None:
                                 send_telegram(
                                     token,
@@ -1465,6 +1590,10 @@ async def command_loop(
                     operation_preview_entry_price=operation_preview_entry_price,
                     operation_preview_target_profit_pct=operation_preview_target_profit_pct,
                 )
+                preview_data, _ = apply_preview_target_to_context(
+                    preview_data,
+                    DEFAULT_PREVIEW_TARGET_CODE,
+                )
                 preview_data = decorate_preview_payload_for_mode(preview_data, trading_mode)
                 preview_message = build_message(preview_template, preview_data)
                 preview_id = build_preview_id(
@@ -1609,6 +1738,10 @@ async def alert_loop():
     if max_usd_per_trade is None:
         max_usd_per_trade = 25.0
     max_usd_per_trade = max(1.0, max_usd_per_trade)
+    max_market_entry_price = parse_float(env.get("MAX_MARKET_ENTRY_PRICE"))
+    if max_market_entry_price is None:
+        max_market_entry_price = DEFAULT_MAX_MARKET_ENTRY_PRICE
+    max_market_entry_price = min(max(0.01, max_market_entry_price), 0.99)
     order_monitor_poll_seconds = parse_int(env.get("ORDER_MONITOR_POLL_SECONDS"))
     if order_monitor_poll_seconds is None:
         order_monitor_poll_seconds = DEFAULT_ORDER_MONITOR_POLL_SECONDS
@@ -1679,6 +1812,10 @@ async def alert_loop():
             f"espera_max={entry_token_wait_seconds}s, "
             f"poll={entry_token_poll_seconds:.1f}s."
         )
+        print(
+            "Control entrada market: "
+            f"precio_max={max_market_entry_price:.3f}."
+        )
 
     startup_message = env.get("STARTUP_MESSAGE", "").strip()
     if not startup_message:
@@ -1713,6 +1850,7 @@ async def alert_loop():
         "signature_type": signature_type_live,
         "max_shares_per_trade": max_shares_per_trade,
         "max_usd_per_trade": max_usd_per_trade,
+        "max_market_entry_price": max_market_entry_price,
         "exit_limit_max_retries": exit_limit_max_retries,
         "exit_limit_retry_seconds": exit_limit_retry_seconds,
         "entry_token_wait_seconds": entry_token_wait_seconds,
@@ -2024,6 +2162,10 @@ async def alert_loop():
                         operation_preview_shares=operation_preview_shares,
                         operation_preview_entry_price=operation_preview_entry_price,
                         operation_preview_target_profit_pct=operation_preview_target_profit_pct,
+                    )
+                    preview_data, _ = apply_preview_target_to_context(
+                        preview_data,
+                        DEFAULT_PREVIEW_TARGET_CODE,
                     )
                     preview_data = decorate_preview_payload_for_mode(preview_data, trading_mode)
                     preview_message = build_message(preview_template, preview_data)
