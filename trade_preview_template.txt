@@ -1,0 +1,24 @@
+<b>{preview_mode_badge} | Radar Tactico {crypto} {timeframe}</b>
+<i>{window_label} -> Proxima {next_window_label}</i>
+
+Senal actual: <b>{operation_pattern}</b> {direction_emoji}
+Objetivo operativo: <b>{operation_target_pattern}</b>
+Lado propuesto: <b>{entry_side}</b> (resultado esperado: {entry_outcome})
+
+Precio subyacente: {price_now} (delta {distance_signed} USD)
+Tiempo para cierre actual: {seconds_to_end}
+
+Entrada estimada proxima vela ({next_window_label}):
+- Precio {entry_outcome}: <b>{entry_price}</b> ({entry_price_source})
+- Up/Down proxima: Up {next_up_price} | Down {next_down_price}
+- Book ref: Bid {next_best_bid} / Ask {next_best_ask}
+- Estado mercado: {next_market_state}
+
+Plan rapido:
+- Shares: {shares}
+- TP: +{target_profit_pct}% -> salida {target_exit_price}
+- USD entrada: {usd_entry}
+- USD salida: {usd_exit}
+- Ganancia esperada: {usd_profit}
+
+<i>{preview_footer}</i>

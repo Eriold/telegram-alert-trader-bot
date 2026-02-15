@@ -15,7 +15,7 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from common.config import PING_EVERY_SECONDS, RTDS_TOPIC, RTDS_WS_URL
+from common.config import GAMMA_BASE, PING_EVERY_SECONDS, RTDS_TOPIC, RTDS_WS_URL
 from common.gamma_api import get_current_window_from_gamma, slug_for_start_epoch
 from common.monitor_presets import MonitorPreset, get_preset
 from common.polymarket_api import get_poly_open_close
@@ -24,11 +24,13 @@ from common.utils import (
     floor_to_window_epoch,
     fmt_usd,
     norm_symbol,
+    safe_json_loads,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 TEMPLATE_PATH = os.path.join(BASE_DIR, "message_template.txt")
+PREVIEW_TEMPLATE_PATH = os.path.join(BASE_DIR, "trade_preview_template.txt")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
 
 HTTP = requests.Session()
@@ -47,6 +49,9 @@ THRESHOLDS = {
 
 DEFAULT_MAX_PATTERN_STREAK = 8
 MIN_PATTERN_TO_ALERT = 3
+DEFAULT_OPERATION_PATTERN_TRIGGER = 6
+DEFAULT_OPERATION_PREVIEW_SHARES = 6
+DEFAULT_OPERATION_PREVIEW_TARGET_PROFIT_PCT = 80.0
 DEFAULT_STATUS_HISTORY_COUNT = 5
 DEFAULT_STATUS_API_WINDOW_RETRIES = 3
 DEFAULT_STATUS_DB_LOOKBACK_MULTIPLIER = 4
@@ -59,6 +64,29 @@ DB_READ_ERRORS_SEEN: Set[Tuple[str, str]] = set()
 DB_WRITE_ERRORS_SEEN: Set[Tuple[str, str]] = set()
 STATUS_HISTORY_CACHE: Dict[str, Dict[int, Dict[str, object]]] = {}
 LIVE_WINDOW_READS_TABLE = "live_window_reads"
+PREVIEW_CALLBACK_PREFIX = "preview_confirm:"
+DEFAULT_ALERT_TEMPLATE = "{crypto} {timeframe} {pattern} {direction_label}"
+DEFAULT_PREVIEW_TEMPLATE = (
+    "<b>{preview_mode_badge} | Radar Tactico {crypto} {timeframe}</b>\n"
+    "<i>{window_label} -> Proxima {next_window_label}</i>\n\n"
+    "Senal actual: <b>{operation_pattern}</b> {direction_emoji}\n"
+    "Objetivo operativo: <b>{operation_target_pattern}</b>\n"
+    "Lado propuesto: <b>{entry_side}</b> (resultado esperado: {entry_outcome})\n\n"
+    "Precio subyacente: {price_now} (delta {distance_signed} USD)\n"
+    "Tiempo para cierre actual: {seconds_to_end}\n\n"
+    "Entrada estimada proxima vela ({next_window_label}):\n"
+    "- Precio {entry_outcome}: <b>{entry_price}</b> ({entry_price_source})\n"
+    "- Up/Down proxima: Up {next_up_price} | Down {next_down_price}\n"
+    "- Book ref: Bid {next_best_bid} / Ask {next_best_ask}\n"
+    "- Estado mercado: {next_market_state}\n\n"
+    "Plan rapido:\n"
+    "- Shares: {shares}\n"
+    "- TP: +{target_profit_pct}% -> salida {target_exit_price}\n"
+    "- USD entrada: {usd_entry}\n"
+    "- USD salida: {usd_exit}\n"
+    "- Ganancia esperada: {usd_profit}\n\n"
+    "<i>{preview_footer}</i>"
+)
 
 COMMAND_MAP = {
     "eth15": ("ETH", "15m"),
@@ -67,6 +95,15 @@ COMMAND_MAP = {
     "btc15": ("BTC", "15m"),
     "btc15m": ("BTC", "15m"),
     "btc1h": ("BTC", "1h"),
+}
+
+PREVIEW_COMMAND_MAP = {
+    "preview-eth15": ("ETH", "15m"),
+    "preview-eth15m": ("ETH", "15m"),
+    "preview-eth1h": ("ETH", "1h"),
+    "preview-btc15": ("BTC", "15m"),
+    "preview-btc15m": ("BTC", "15m"),
+    "preview-btc1h": ("BTC", "1h"),
 }
 
 
@@ -94,6 +131,8 @@ class WindowState:
     min_price: Optional[float] = None
     max_price: Optional[float] = None
     alert_sent: bool = False
+    preview_sent: bool = False
+    preview_id: Optional[str] = None
     audit_seen: Set[str] = field(default_factory=set)
 
 
@@ -189,9 +228,9 @@ def parse_chat_ids(env: Dict[str, str]) -> List[str]:
     return [t for t in tokens if t]
 
 
-def load_template(path: str) -> str:
+def load_template(path: str, default_template: str = DEFAULT_ALERT_TEMPLATE) -> str:
     if not os.path.exists(path):
-        return "{crypto} {timeframe} {pattern} {direction_label}"
+        return default_template
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read().strip()
 
@@ -209,6 +248,21 @@ def load_state(path: str) -> Dict[str, Dict[str, object]]:
 def save_state(path: str, state: Dict[str, Dict[str, object]]) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2, sort_keys=True)
+
+
+def persist_window_state(
+    state_file: Dict[str, Dict[str, object]],
+    market_key: str,
+    state: WindowState,
+) -> None:
+    if not state.window_key:
+        return
+    state_file[market_key] = {
+        "window_key": state.window_key,
+        "alert_sent": state.alert_sent,
+        "preview_sent": state.preview_sent,
+    }
+    save_state(STATE_PATH, state_file)
 
 
 def ensure_live_window_reads_table(conn: sqlite3.Connection) -> None:
@@ -1154,6 +1208,240 @@ def format_seconds(seconds: float) -> str:
     return f"{int(seconds)}s"
 
 
+def format_signed(value: float) -> str:
+    return f"{value:+,.2f}"
+
+
+def format_optional_decimal(value: Optional[float], decimals: int = 2) -> str:
+    if value is None:
+        return "N/D"
+    return f"{value:,.{decimals}f}"
+
+
+def build_preview_id(
+    preset: MonitorPreset,
+    window_start: datetime,
+    nonce: Optional[str] = None,
+) -> str:
+    start_epoch = int(window_start.astimezone(timezone.utc).timestamp())
+    base = f"{preset.symbol.lower()}{preset.timeframe_label.lower()}{start_epoch}"
+    if nonce:
+        return f"{base}-{nonce}"
+    return base
+
+
+def build_preview_confirmation_message(context: Dict[str, object]) -> str:
+    crypto = str(context.get("crypto", "N/D"))
+    timeframe = str(context.get("timeframe", "N/D"))
+    operation_pattern = str(context.get("operation_pattern", "N/D"))
+    window_label = str(context.get("window_label", "N/D"))
+    entry_side = str(context.get("entry_side", "N/D"))
+    return (
+        "Confirmacion recibida (solo preview).\n"
+        f"Mercado: {crypto} {timeframe}\n"
+        f"Operacion detectada: {operation_pattern}\n"
+        f"Ventana: {window_label}\n"
+        f"Lado propuesto: {entry_side}\n"
+        "No se ejecuto ninguna orden automatica."
+    )
+
+
+def parse_list_like(value: object) -> List[object]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        parsed = safe_json_loads(value)
+        if isinstance(parsed, list):
+            return parsed
+    return []
+
+
+def parse_gamma_up_down_prices(market: Dict[str, object]) -> Tuple[Optional[float], Optional[float]]:
+    outcomes = parse_list_like(market.get("outcomes"))
+    outcome_prices = parse_list_like(market.get("outcomePrices"))
+    outcome_map: Dict[str, float] = {}
+    max_len = min(len(outcomes), len(outcome_prices))
+    for idx in range(max_len):
+        outcome_label = str(outcomes[idx]).strip().lower()
+        price_value = parse_float(str(outcome_prices[idx]))
+        if price_value is None:
+            continue
+        outcome_map[outcome_label] = price_value
+
+    up_price = outcome_map.get("up")
+    down_price = outcome_map.get("down")
+    if up_price is None or down_price is None:
+        # Fallback by order if outcome labels are missing.
+        fallback_prices = [parse_float(str(p)) for p in outcome_prices]
+        fallback_clean = [p for p in fallback_prices if p is not None]
+        if len(fallback_clean) >= 2:
+            up_price = fallback_clean[0]
+            down_price = fallback_clean[1]
+    return up_price, down_price
+
+
+def fetch_next_window_market_snapshot(
+    preset: MonitorPreset,
+    current_window_end: datetime,
+) -> Dict[str, object]:
+    next_start = current_window_end.astimezone(timezone.utc)
+    next_end = next_start + timedelta(seconds=preset.window_seconds)
+    next_slug = slug_for_start_epoch(int(next_start.timestamp()), preset.market_slug_prefix)
+    snapshot: Dict[str, object] = {
+        "next_slug": next_slug,
+        "next_window_label": f"{dt_to_local_hhmm(next_start)}-{dt_to_local_hhmm(next_end)}",
+        "next_up_price": None,
+        "next_down_price": None,
+        "next_best_bid": None,
+        "next_best_ask": None,
+        "next_market_state": "N/D",
+    }
+    try:
+        resp = HTTP.get(f"{GAMMA_BASE}/markets/slug/{next_slug}", timeout=10)
+        if resp.status_code != 200:
+            snapshot["next_market_state"] = f"unavailable ({resp.status_code})"
+            return snapshot
+
+        market = resp.json() or {}
+        up_price, down_price = parse_gamma_up_down_prices(market)
+        snapshot["next_up_price"] = up_price
+        snapshot["next_down_price"] = down_price
+        snapshot["next_best_bid"] = parse_float(str(market.get("bestBid")))
+        snapshot["next_best_ask"] = parse_float(str(market.get("bestAsk")))
+
+        accepting_orders = market.get("acceptingOrders")
+        is_active = market.get("active")
+        is_closed = market.get("closed")
+        if accepting_orders is True:
+            snapshot["next_market_state"] = "OPEN"
+        elif is_active is True and is_closed is False:
+            snapshot["next_market_state"] = "ACTIVE"
+        elif is_closed is True:
+            snapshot["next_market_state"] = "CLOSED"
+        else:
+            snapshot["next_market_state"] = "N/D"
+        return snapshot
+    except Exception as exc:
+        snapshot["next_market_state"] = f"error ({exc.__class__.__name__})"
+        return snapshot
+
+
+def build_preview_payload(
+    preset: MonitorPreset,
+    w_start: datetime,
+    w_end: datetime,
+    seconds_to_end: float,
+    live_price: Optional[float],
+    current_dir: Optional[str],
+    current_delta: Optional[float],
+    operation_pattern: str,
+    operation_pattern_trigger: int,
+    operation_preview_shares: int,
+    operation_preview_entry_price: Optional[float],
+    operation_preview_target_profit_pct: float,
+) -> Dict[str, object]:
+    window_label = f"{dt_to_local_hhmm(w_start)}-{dt_to_local_hhmm(w_end)}"
+    next_snapshot = fetch_next_window_market_snapshot(preset, w_end)
+
+    entry_side = "N/D"
+    entry_outcome = "N/D"
+    operation_target_pattern = "N/D"
+    if current_dir == "UP":
+        entry_side = "NO"
+        entry_outcome = "DOWN"
+        operation_target_pattern = f"DOWN{operation_pattern_trigger}"
+    elif current_dir == "DOWN":
+        entry_side = "YES"
+        entry_outcome = "UP"
+        operation_target_pattern = f"UP{operation_pattern_trigger}"
+
+    entry_price: Optional[float] = None
+    entry_price_source = "N/D"
+    next_up_price = next_snapshot.get("next_up_price")
+    next_down_price = next_snapshot.get("next_down_price")
+    if entry_outcome == "UP":
+        entry_price = next_up_price if isinstance(next_up_price, float) else None
+    elif entry_outcome == "DOWN":
+        entry_price = next_down_price if isinstance(next_down_price, float) else None
+
+    if entry_price is not None:
+        entry_price_source = f"gamma:{next_snapshot.get('next_slug')}"
+    elif operation_preview_entry_price is not None:
+        entry_price = operation_preview_entry_price
+        entry_price_source = "fallback:.env OPERATION_PREVIEW_ENTRY_PRICE"
+
+    target_exit_price: Optional[float] = None
+    usd_entry: Optional[float] = None
+    usd_exit: Optional[float] = None
+    usd_profit: Optional[float] = None
+    if entry_price is not None:
+        raw_target_exit_price = entry_price * (1.0 + (operation_preview_target_profit_pct / 100.0))
+        target_exit_price = min(raw_target_exit_price, 0.99)
+        usd_entry = operation_preview_shares * entry_price
+        usd_exit = operation_preview_shares * target_exit_price
+        usd_profit = usd_exit - usd_entry
+
+    direction_emoji = "\u26AA"
+    if current_dir == "UP":
+        direction_emoji = "\U0001F7E2"
+    elif current_dir == "DOWN":
+        direction_emoji = "\U0001F534"
+
+    signed_delta = "N/D"
+    if current_delta is not None:
+        signed_delta = format_signed(current_delta)
+
+    return {
+        "crypto": preset.symbol,
+        "timeframe": preset.timeframe_label,
+        "operation_pattern": operation_pattern,
+        "operation_target_pattern": operation_target_pattern,
+        "operation_trigger": operation_pattern_trigger,
+        "direction_emoji": direction_emoji,
+        "window_label": window_label,
+        "next_window_label": str(next_snapshot.get("next_window_label", "N/D")),
+        "seconds_to_end": format_seconds(seconds_to_end),
+        "price_now": fmt_usd(live_price),
+        "distance_signed": signed_delta,
+        "shares": operation_preview_shares,
+        "entry_side": entry_side,
+        "entry_outcome": entry_outcome,
+        "entry_price": format_optional_decimal(entry_price, decimals=3),
+        "entry_price_source": entry_price_source,
+        "next_up_price": format_optional_decimal(
+            next_up_price if isinstance(next_up_price, float) else None,
+            decimals=3,
+        ),
+        "next_down_price": format_optional_decimal(
+            next_down_price if isinstance(next_down_price, float) else None,
+            decimals=3,
+        ),
+        "next_best_bid": format_optional_decimal(
+            next_snapshot.get("next_best_bid")
+            if isinstance(next_snapshot.get("next_best_bid"), float)
+            else None,
+            decimals=3,
+        ),
+        "next_best_ask": format_optional_decimal(
+            next_snapshot.get("next_best_ask")
+            if isinstance(next_snapshot.get("next_best_ask"), float)
+            else None,
+            decimals=3,
+        ),
+        "next_market_state": str(next_snapshot.get("next_market_state", "N/D")),
+        "target_profit_pct": format_optional_decimal(operation_preview_target_profit_pct, decimals=2),
+        "target_exit_price": format_optional_decimal(target_exit_price, decimals=3),
+        "usd_entry": format_optional_decimal(usd_entry, decimals=2),
+        "usd_exit": format_optional_decimal(usd_exit, decimals=2),
+        "usd_profit": format_optional_decimal(usd_profit, decimals=2),
+        "preview_mode_badge": "PREVIEW",
+        "preview_footer": (
+            'Boton "Confirmar operacion" activo solo para simulacion. '
+            "No ejecuta ordenes reales."
+        ),
+    }
+
+
 def audit_log(enabled: bool, market_key: str, message: str) -> None:
     if not enabled:
         return
@@ -1181,6 +1469,7 @@ def send_telegram(
     chat_id: str,
     message: str,
     parse_mode: str = "HTML",
+    reply_markup: Optional[Dict[str, object]] = None,
 ) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -1189,6 +1478,8 @@ def send_telegram(
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup, separators=(",", ":"))
     try:
         resp = HTTP.post(url, data=payload, timeout=10)
         if resp.status_code >= 400:
@@ -1197,6 +1488,30 @@ def send_telegram(
         return True
     except Exception as exc:
         print(f"Telegram error: {exc}")
+        return False
+
+
+def answer_callback_query(
+    token: str,
+    callback_query_id: str,
+    text: str = "",
+    show_alert: bool = False,
+) -> bool:
+    url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+    payload: Dict[str, object] = {
+        "callback_query_id": callback_query_id,
+        "show_alert": show_alert,
+    }
+    if text:
+        payload["text"] = text
+    try:
+        resp = HTTP.post(url, data=payload, timeout=10)
+        if resp.status_code >= 400:
+            print(f"Telegram callback error {resp.status_code}: {resp.text[:200]}")
+            return False
+        return True
+    except Exception as exc:
+        print(f"Telegram callback error: {exc}")
         return False
 
 
@@ -1321,6 +1636,7 @@ async def command_loop(
     env: Dict[str, str],
     prices: Dict[str, Tuple[float, datetime]],
     presets_by_key: Dict[str, MonitorPreset],
+    preview_registry: Dict[str, Dict[str, object]],
 ):
     token = env.get("BOT_TOKEN", "")
     parse_mode = env.get("TELEGRAM_PARSE_MODE", "HTML")
@@ -1333,11 +1649,33 @@ async def command_loop(
     if status_api_window_retries is None:
         status_api_window_retries = DEFAULT_STATUS_API_WINDOW_RETRIES
     status_api_window_retries = max(1, status_api_window_retries)
+    max_pattern_streak = parse_int(env.get("MAX_PATTERN_STREAK"))
+    if max_pattern_streak is None:
+        max_pattern_streak = DEFAULT_MAX_PATTERN_STREAK
+    max_pattern_streak = max(MIN_PATTERN_TO_ALERT, max_pattern_streak)
+    operation_pattern_trigger = parse_int(env.get("OPERATION_PATTERN_TRIGGER"))
+    if operation_pattern_trigger is None:
+        operation_pattern_trigger = DEFAULT_OPERATION_PATTERN_TRIGGER
+    operation_pattern_trigger = max(MIN_PATTERN_TO_ALERT, operation_pattern_trigger)
+    operation_pattern_trigger = min(max_pattern_streak, operation_pattern_trigger)
+    operation_preview_shares = parse_int(env.get("OPERATION_PREVIEW_SHARES"))
+    if operation_preview_shares is None:
+        operation_preview_shares = DEFAULT_OPERATION_PREVIEW_SHARES
+    operation_preview_shares = max(1, operation_preview_shares)
+    operation_preview_entry_price = parse_float(env.get("OPERATION_PREVIEW_ENTRY_PRICE"))
+    operation_preview_target_profit_pct = parse_float(env.get("OPERATION_PREVIEW_TARGET_PROFIT_PCT"))
+    if operation_preview_target_profit_pct is None:
+        operation_preview_target_profit_pct = DEFAULT_OPERATION_PREVIEW_TARGET_PROFIT_PCT
+    operation_preview_target_profit_pct = max(0.0, operation_preview_target_profit_pct)
     max_live_price_age_seconds = parse_int(env.get("MAX_LIVE_PRICE_AGE_SECONDS"))
     if max_live_price_age_seconds is None:
         max_live_price_age_seconds = DEFAULT_MAX_LIVE_PRICE_AGE_SECONDS
     max_live_price_age_seconds = max(1, max_live_price_age_seconds)
     allowed_chat_ids = set(parse_chat_ids(env))
+    preview_template = load_template(
+        PREVIEW_TEMPLATE_PATH,
+        default_template=DEFAULT_PREVIEW_TEMPLATE,
+    )
 
     last_update_id: Optional[int] = None
     seen_chat_ids: set = set()
@@ -1354,6 +1692,72 @@ async def command_loop(
             update_id = upd.get("update_id")
             if isinstance(update_id, int):
                 last_update_id = max(last_update_id or update_id, update_id)
+
+            callback_query = upd.get("callback_query") or {}
+            callback_id = callback_query.get("id")
+            callback_data = str(callback_query.get("data") or "")
+            callback_message = callback_query.get("message") or {}
+            callback_chat = callback_message.get("chat") or {}
+            callback_chat_id = callback_chat.get("id")
+            if callback_chat_id is not None and callback_chat_id not in seen_chat_ids:
+                chat_type = callback_chat.get("type") or "unknown"
+                chat_title = callback_chat.get("title") or ""
+                label = f"{chat_type}"
+                if chat_title:
+                    label = f"{chat_type} ({chat_title})"
+                print(f"Chat ID detectado: {callback_chat_id} [{label}]")
+                seen_chat_ids.add(callback_chat_id)
+
+            if callback_data:
+                if allowed_chat_ids and str(callback_chat_id) not in allowed_chat_ids:
+                    if callback_id:
+                        answer_callback_query(
+                            token,
+                            str(callback_id),
+                            text="Chat no autorizado para esta accion.",
+                            show_alert=True,
+                        )
+                    continue
+
+                if callback_data.startswith(PREVIEW_CALLBACK_PREFIX):
+                    preview_id = callback_data[len(PREVIEW_CALLBACK_PREFIX) :]
+                    preview_context = preview_registry.get(preview_id)
+                    if preview_context is None:
+                        if callback_id:
+                            answer_callback_query(
+                                token,
+                                str(callback_id),
+                                text="Preview expirada o no disponible.",
+                                show_alert=False,
+                            )
+                        continue
+
+                    if callback_id:
+                        answer_callback_query(
+                            token,
+                            str(callback_id),
+                            text="Confirmada. Aun sin orden real.",
+                            show_alert=False,
+                        )
+
+                    if callback_chat_id is not None:
+                        confirmation = build_preview_confirmation_message(preview_context)
+                        send_telegram(
+                            token,
+                            str(callback_chat_id),
+                            confirmation,
+                            parse_mode=parse_mode,
+                        )
+                    preview_registry.pop(preview_id, None)
+                else:
+                    if callback_id:
+                        answer_callback_query(
+                            token,
+                            str(callback_id),
+                            text="Accion no soportada.",
+                            show_alert=False,
+                        )
+                continue
 
             message = upd.get("message") or upd.get("edited_message")
             if not message:
@@ -1374,48 +1778,153 @@ async def command_loop(
                 print(f"Chat ID detectado: {chat_id} [{label}]")
                 seen_chat_ids.add(chat_id)
 
-            if not cmd or cmd not in COMMAND_MAP:
+            if not cmd:
                 continue
 
             if allowed_chat_ids and str(chat_id) not in allowed_chat_ids:
                 continue
 
-            crypto, timeframe = COMMAND_MAP[cmd]
-            preset = presets_by_key.get(f"{crypto}-{timeframe}")
-            if preset is None:
+            if cmd in COMMAND_MAP:
+                crypto, timeframe = COMMAND_MAP[cmd]
+                preset = presets_by_key.get(f"{crypto}-{timeframe}")
+                if preset is None:
+                    continue
+
+                _, w_start, w_end = get_current_window(preset)
+                window_key = w_start.isoformat()
+                now = datetime.now(timezone.utc)
+
+                open_price, _ = resolve_open_price(
+                    preset,
+                    w_start,
+                    w_end,
+                    window_key,
+                    retries=status_api_window_retries,
+                )
+                live_price, _, _ = get_live_price_with_fallback(
+                    preset,
+                    w_start,
+                    w_end,
+                    prices,
+                    now,
+                    max_live_price_age_seconds,
+                )
+
+                history_rows = fetch_status_history_rows(
+                    preset,
+                    w_start,
+                    history_count,
+                    api_window_retries=status_api_window_retries,
+                )
+
+                response = build_status_message(
+                    preset, w_start, w_end, live_price, open_price, history_rows
+                )
+                send_telegram(token, str(chat_id), response, parse_mode=parse_mode)
                 continue
 
-            _, w_start, w_end = get_current_window(preset)
-            window_key = w_start.isoformat()
-            now = datetime.now(timezone.utc)
+            if cmd in PREVIEW_COMMAND_MAP:
+                crypto, timeframe = PREVIEW_COMMAND_MAP[cmd]
+                preset = presets_by_key.get(f"{crypto}-{timeframe}")
+                if preset is None:
+                    continue
 
-            open_price, _ = resolve_open_price(
-                preset,
-                w_start,
-                w_end,
-                window_key,
-                retries=status_api_window_retries,
-            )
-            live_price, _, _ = get_live_price_with_fallback(
-                preset,
-                w_start,
-                w_end,
-                prices,
-                now,
-                max_live_price_age_seconds,
-            )
+                _, w_start, w_end = get_current_window(preset)
+                window_key = w_start.isoformat()
+                now = datetime.now(timezone.utc)
+                seconds_to_end = (w_end - now).total_seconds()
 
-            history_rows = fetch_status_history_rows(
-                preset,
-                w_start,
-                history_count,
-                api_window_retries=status_api_window_retries,
-            )
+                open_price, _ = resolve_open_price(
+                    preset,
+                    w_start,
+                    w_end,
+                    window_key,
+                    retries=status_api_window_retries,
+                )
+                live_price, _, _ = get_live_price_with_fallback(
+                    preset,
+                    w_start,
+                    w_end,
+                    prices,
+                    now,
+                    max_live_price_age_seconds,
+                )
 
-            response = build_status_message(
-                preset, w_start, w_end, live_price, open_price, history_rows
-            )
-            send_telegram(token, str(chat_id), response, parse_mode=parse_mode)
+                current_delta: Optional[float] = None
+                current_dir: Optional[str] = None
+                pattern_label = "N/D"
+                if open_price is not None and live_price is not None:
+                    current_delta = live_price - open_price
+                    current_dir = "UP" if current_delta >= 0 else "DOWN"
+
+                    directions = fetch_last_closed_directions_excluding_current(
+                        preset.db_path,
+                        preset.series_slug,
+                        window_key,
+                        preset.window_seconds,
+                        limit=max_pattern_streak,
+                        audit=[],
+                    )
+                    if len(directions) < max_pattern_streak:
+                        api_directions = fetch_recent_directions_via_api(
+                            preset,
+                            w_start,
+                            limit=max_pattern_streak,
+                            retries_per_window=status_api_window_retries,
+                            audit=[],
+                        )
+                        if len(api_directions) >= len(directions) and api_directions:
+                            directions = api_directions
+
+                    streak_before_current = count_consecutive_directions(
+                        directions,
+                        current_dir,
+                        max_count=max_pattern_streak,
+                    )
+                    pattern_over_limit = streak_before_current >= max_pattern_streak
+                    pattern_count = min(streak_before_current + 1, max_pattern_streak)
+                    pattern_suffix = "+" if pattern_over_limit else ""
+                    pattern_label = f"{current_dir}{pattern_count}{pattern_suffix}"
+
+                preview_data = build_preview_payload(
+                    preset=preset,
+                    w_start=w_start,
+                    w_end=w_end,
+                    seconds_to_end=seconds_to_end,
+                    live_price=live_price,
+                    current_dir=current_dir,
+                    current_delta=current_delta,
+                    operation_pattern=pattern_label,
+                    operation_pattern_trigger=operation_pattern_trigger,
+                    operation_preview_shares=operation_preview_shares,
+                    operation_preview_entry_price=operation_preview_entry_price,
+                    operation_preview_target_profit_pct=operation_preview_target_profit_pct,
+                )
+                preview_message = build_message(preview_template, preview_data)
+                preview_id = build_preview_id(
+                    preset,
+                    w_start,
+                    nonce=str(int(now.timestamp() * 1000)),
+                )
+                preview_registry[preview_id] = preview_data
+                reply_markup = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "Confirmar operacion",
+                                "callback_data": f"{PREVIEW_CALLBACK_PREFIX}{preview_id}",
+                            }
+                        ]
+                    ]
+                }
+                send_telegram(
+                    token,
+                    str(chat_id),
+                    preview_message,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                )
+                continue
 
         await asyncio.sleep(command_poll_seconds)
 
@@ -1443,6 +1952,21 @@ async def alert_loop():
     if status_api_window_retries is None:
         status_api_window_retries = DEFAULT_STATUS_API_WINDOW_RETRIES
     status_api_window_retries = max(1, status_api_window_retries)
+    operation_preview_enabled = parse_bool(env.get("OPERATION_PREVIEW_ENABLED"), default=True)
+    operation_pattern_trigger = parse_int(env.get("OPERATION_PATTERN_TRIGGER"))
+    if operation_pattern_trigger is None:
+        operation_pattern_trigger = DEFAULT_OPERATION_PATTERN_TRIGGER
+    operation_pattern_trigger = max(MIN_PATTERN_TO_ALERT, operation_pattern_trigger)
+    operation_pattern_trigger = min(max_pattern_streak, operation_pattern_trigger)
+    operation_preview_shares = parse_int(env.get("OPERATION_PREVIEW_SHARES"))
+    if operation_preview_shares is None:
+        operation_preview_shares = DEFAULT_OPERATION_PREVIEW_SHARES
+    operation_preview_shares = max(1, operation_preview_shares)
+    operation_preview_entry_price = parse_float(env.get("OPERATION_PREVIEW_ENTRY_PRICE"))
+    operation_preview_target_profit_pct = parse_float(env.get("OPERATION_PREVIEW_TARGET_PROFIT_PCT"))
+    if operation_preview_target_profit_pct is None:
+        operation_preview_target_profit_pct = DEFAULT_OPERATION_PREVIEW_TARGET_PROFIT_PCT
+    operation_preview_target_profit_pct = max(0.0, operation_preview_target_profit_pct)
     rtds_use_proxy = parse_bool(env.get("RTDS_USE_PROXY"), default=True)
     proxy_url = env.get("PROXY_URL", "").strip()
 
@@ -1461,7 +1985,11 @@ async def alert_loop():
     if not shutdown_message:
         shutdown_message = "Bot finalizado"
 
-    template = load_template(TEMPLATE_PATH)
+    template = load_template(TEMPLATE_PATH, default_template=DEFAULT_ALERT_TEMPLATE)
+    preview_template = load_template(
+        PREVIEW_TEMPLATE_PATH,
+        default_template=DEFAULT_PREVIEW_TEMPLATE,
+    )
     state_file = load_state(STATE_PATH)
 
     presets: List[MonitorPreset] = [get_preset(c, t) for (c, t) in TARGETS]
@@ -1472,11 +2000,14 @@ async def alert_loop():
 
     target_symbols = {norm_symbol(f"{p.symbol}/USD") for p in presets}
     prices: Dict[str, Tuple[float, datetime]] = {}
+    preview_registry: Dict[str, Dict[str, object]] = {}
 
     price_task = asyncio.create_task(
         rtds_price_loop(prices, target_symbols, use_proxy=rtds_use_proxy)
     )
-    command_task = asyncio.create_task(command_loop(env, prices, presets_by_key))
+    command_task = asyncio.create_task(
+        command_loop(env, prices, presets_by_key, preview_registry)
+    )
 
     try:
         while True:
@@ -1495,12 +2026,16 @@ async def alert_loop():
                 window_label = f"{dt_to_local_hhmm(w_start)}-{dt_to_local_hhmm(w_end)}"
 
                 if w_state.window_key != window_key:
+                    if w_state.preview_id:
+                        preview_registry.pop(w_state.preview_id, None)
                     w_state.window_key = window_key
                     w_state.open_price = None
                     w_state.open_source = None
                     w_state.min_price = None
                     w_state.max_price = None
                     w_state.alert_sent = False
+                    w_state.preview_sent = False
+                    w_state.preview_id = None
                     w_state.audit_seen.clear()
                     saved = state_file.get(key)
                     if (
@@ -1509,6 +2044,12 @@ async def alert_loop():
                         and saved.get("alert_sent") is True
                     ):
                         w_state.alert_sent = True
+                    if (
+                        isinstance(saved, dict)
+                        and saved.get("window_key") == window_key
+                        and saved.get("preview_sent") is True
+                    ):
+                        w_state.preview_sent = True
 
                 open_value, open_source = resolve_open_price(
                     preset,
@@ -1582,14 +2123,7 @@ async def alert_loop():
                 if seconds_to_end > alert_before_seconds or seconds_to_end < alert_after_seconds:
                     continue
 
-                if w_state.alert_sent:
-                    audit_log_once(
-                        alert_audit_logs,
-                        w_state,
-                        key,
-                        "alert_already_sent",
-                        f"Alerta ya enviada para {window_label}; no se reenvia en esta ventana.",
-                    )
+                if w_state.alert_sent and (not operation_preview_enabled or w_state.preview_sent):
                     continue
 
                 # Last closed directions to determine dynamic streak (UPn / DOWNn)
@@ -1682,53 +2216,120 @@ async def alert_loop():
                 pattern_count = min(streak_before_current + 1, max_pattern_streak)
                 pattern_suffix = "+" if pattern_over_limit else ""
                 pattern_label = f"{direction_label}{pattern_count}{pattern_suffix}"
+                if not w_state.alert_sent:
+                    data = {
+                        "crypto": preset.symbol,
+                        "timeframe": preset.timeframe_label,
+                        "pattern": pattern_label,
+                        "direction_label": direction_label,
+                        "direction_emoji": direction_emoji,
+                        "window_label": window_label,
+                        "seconds_to_end": format_seconds(seconds_to_end),
+                        "price_now": fmt_usd(live_price),
+                        "open_price": fmt_usd(w_state.open_price),
+                        "open_source": w_state.open_source or "OPEN",
+                        "distance": f"{distance:,.2f}",
+                        "threshold": threshold_label,
+                        "max_price": fmt_usd(w_state.max_price),
+                        "min_price": fmt_usd(w_state.min_price),
+                        "live_time": dt_to_local_hhmm(live_ts) if live_ts is not None else dt_to_local_hhmm(now),
+                    }
 
-                data = {
-                    "crypto": preset.symbol,
-                    "timeframe": preset.timeframe_label,
-                    "pattern": pattern_label,
-                    "direction_label": direction_label,
-                    "direction_emoji": direction_emoji,
-                    "window_label": window_label,
-                    "seconds_to_end": format_seconds(seconds_to_end),
-                    "price_now": fmt_usd(live_price),
-                    "open_price": fmt_usd(w_state.open_price),
-                    "open_source": w_state.open_source or "OPEN",
-                    "distance": f"{distance:,.2f}",
-                    "threshold": threshold_label,
-                    "max_price": fmt_usd(w_state.max_price),
-                    "min_price": fmt_usd(w_state.min_price),
-                    "live_time": dt_to_local_hhmm(live_ts) if live_ts is not None else dt_to_local_hhmm(now),
-                }
+                    message = build_message(template, data)
+                    sent_any = False
+                    for chat_id in chat_ids:
+                        if send_telegram(token, chat_id, message, parse_mode=parse_mode):
+                            sent_any = True
+                    if sent_any:
+                        w_state.alert_sent = True
+                        persist_window_state(state_file, key, w_state)
+                        print(f"Alerta enviada: {key} {window_label} {pattern_label}")
+                        audit_log(
+                            alert_audit_logs,
+                            key,
+                            (
+                                f"Alerta confirmada {pattern_label} en {window_label}: "
+                                f"src={direction_source}, cadena={direction_chain}, "
+                                f"distancia={distance:,.2f}, threshold={threshold_label}, "
+                                f"precio={live_price:,.2f}, base={w_state.open_price:,.2f}"
+                            ),
+                        )
+                    else:
+                        audit_log_once(
+                            alert_audit_logs,
+                            w_state,
+                            key,
+                            "telegram_send_failed",
+                            f"Se genero alerta para {window_label} pero Telegram no confirmo envio.",
+                        )
 
-                message = build_message(template, data)
-                sent_any = False
-                for chat_id in chat_ids:
-                    if send_telegram(token, chat_id, message, parse_mode=parse_mode):
-                        sent_any = True
-                if sent_any:
-                    w_state.alert_sent = True
-                    state_file[key] = {"window_key": window_key, "alert_sent": True}
-                    save_state(STATE_PATH, state_file)
-                    print(f"Alerta enviada: {key} {window_label} {pattern_label}")
-                    audit_log(
-                        alert_audit_logs,
-                        key,
-                        (
-                            f"Alerta confirmada {pattern_label} en {window_label}: "
-                            f"src={direction_source}, cadena={direction_chain}, "
-                            f"distancia={distance:,.2f}, threshold={threshold_label}, "
-                            f"precio={live_price:,.2f}, base={w_state.open_price:,.2f}"
-                        ),
+                if (
+                    operation_preview_enabled
+                    and not w_state.preview_sent
+                    and pattern_count >= operation_pattern_trigger
+                ):
+                    preview_data = build_preview_payload(
+                        preset=preset,
+                        w_start=w_start,
+                        w_end=w_end,
+                        seconds_to_end=seconds_to_end,
+                        live_price=live_price,
+                        current_dir=current_dir,
+                        current_delta=current_delta,
+                        operation_pattern=pattern_label,
+                        operation_pattern_trigger=operation_pattern_trigger,
+                        operation_preview_shares=operation_preview_shares,
+                        operation_preview_entry_price=operation_preview_entry_price,
+                        operation_preview_target_profit_pct=operation_preview_target_profit_pct,
                     )
-                else:
-                    audit_log_once(
-                        alert_audit_logs,
-                        w_state,
-                        key,
-                        "telegram_send_failed",
-                        f"Se genero alerta para {window_label} pero Telegram no confirmo envio.",
-                    )
+                    preview_message = build_message(preview_template, preview_data)
+                    preview_id = build_preview_id(preset, w_start)
+                    preview_registry[preview_id] = preview_data
+                    reply_markup = {
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": "Confirmar operacion",
+                                    "callback_data": f"{PREVIEW_CALLBACK_PREFIX}{preview_id}",
+                                }
+                            ]
+                        ]
+                    }
+
+                    preview_sent_any = False
+                    for chat_id in chat_ids:
+                        if send_telegram(
+                            token,
+                            chat_id,
+                            preview_message,
+                            parse_mode=parse_mode,
+                            reply_markup=reply_markup,
+                        ):
+                            preview_sent_any = True
+
+                    if preview_sent_any:
+                        w_state.preview_sent = True
+                        w_state.preview_id = preview_id
+                        persist_window_state(state_file, key, w_state)
+                        print(f"Preview enviada: {key} {window_label} {pattern_label}")
+                        audit_log(
+                            alert_audit_logs,
+                            key,
+                            (
+                                f"Preview confirmable {pattern_label} en {window_label}: "
+                                f"shares={operation_preview_shares}, "
+                                f"entry={preview_data.get('entry_price')}, "
+                                f"exit={preview_data.get('target_exit_price')}"
+                            ),
+                        )
+                    else:
+                        audit_log_once(
+                            alert_audit_logs,
+                            w_state,
+                            key,
+                            "preview_send_failed",
+                            f"Se genero preview para {window_label} pero Telegram no confirmo envio.",
+                        )
 
             await asyncio.sleep(poll_seconds)
     finally:
