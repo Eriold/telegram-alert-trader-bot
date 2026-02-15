@@ -198,6 +198,11 @@ def build_help_message(trading_mode: str) -> str:
         "<code>/preview-eth1h</code> -> Crea preview de operacion ETH 1h\n"
         "<code>/preview-btc15m</code> -> Crea preview de operacion BTC 15m\n"
         "<code>/preview-btc1h</code> -> Crea preview de operacion BTC 1h\n"
+        "\n<b>Current automatico</b>\n"
+        "<code>/current-eth15m</code> -> Crea preview para operar la vela actual ETH 15m\n"
+        "<code>/current-eth1h</code> -> Crea preview para operar la vela actual ETH 1h\n"
+        "<code>/current-btc15m</code> -> Crea preview para operar la vela actual BTC 15m\n"
+        "<code>/current-btc1h</code> -> Crea preview para operar la vela actual BTC 1h\n"
         "Botones de salida fija en cada preview: <code>0.70</code>, <code>0.80</code>, <code>0.99</code>\n\n"
         "<b>Preview manual</b>\n"
         "<code>/eth15m-B-sha-10-V-0.50</code> -> Ejemplo compra YES manual\n"
@@ -295,16 +300,20 @@ def decorate_preview_payload_for_mode(
     trading_mode: str,
 ) -> Dict[str, object]:
     payload = dict(preview_payload)
+    scope = str(payload.get("entry_scope") or "next").strip().lower()
+    scope_label = "vela actual" if scope == "current" else "proxima vela"
     if trading_mode == "live":
-        payload["preview_mode_badge"] = "LIVE READY"
+        payload["preview_mode_badge"] = "CURRENT LIVE READY" if scope == "current" else "LIVE READY"
         payload["preview_footer"] = (
             "Al confirmar, el bot enviara orden REAL (market + limit) "
-            "segun el boton 70%/80%/0.99. Primer clic bloquea el preview."
+            f"sobre {scope_label}, segun el boton 70%/80%/0.99. "
+            "Primer clic bloquea el preview."
         )
     else:
-        payload["preview_mode_badge"] = "PREVIEW"
+        payload["preview_mode_badge"] = "CURRENT PREVIEW" if scope == "current" else "PREVIEW"
         payload["preview_footer"] = (
             "Botones 70%/80%/0.99 activos solo para simulacion. "
+            f"Entrada objetivo: {scope_label}. "
             "No ejecuta ordenes reales. Primer clic bloquea el preview."
         )
     return payload
@@ -315,6 +324,48 @@ def build_wallet_history_url(wallet_address: Optional[str]) -> str:
     if not wallet:
         return ""
     return f"https://zapper.xyz/es/account/{wallet}?tab=history"
+
+
+def apply_current_window_snapshot_to_preview(
+    preview_payload: Dict[str, object],
+    preset: MonitorPreset,
+    window_start: datetime,
+) -> Dict[str, object]:
+    payload = dict(preview_payload)
+    snapshot = fetch_window_market_snapshot(preset, window_start)
+    payload["entry_scope"] = "current"
+    payload["next_window_label"] = str(snapshot.get("window_label", payload.get("window_label", "N/D")))
+    payload["next_slug"] = str(snapshot.get("slug", payload.get("next_slug", "N/D")))
+
+    up_price = parse_float(str(snapshot.get("up_price")))
+    down_price = parse_float(str(snapshot.get("down_price")))
+    up_token_id = str(snapshot.get("up_token_id") or "").strip()
+    down_token_id = str(snapshot.get("down_token_id") or "").strip()
+    best_bid = parse_float(str(snapshot.get("best_bid")))
+    best_ask = parse_float(str(snapshot.get("best_ask")))
+
+    payload["next_up_price"] = format_optional_decimal(up_price, decimals=3)
+    payload["next_down_price"] = format_optional_decimal(down_price, decimals=3)
+    payload["next_up_token_id"] = up_token_id
+    payload["next_down_token_id"] = down_token_id
+    payload["next_best_bid"] = format_optional_decimal(best_bid, decimals=3)
+    payload["next_best_ask"] = format_optional_decimal(best_ask, decimals=3)
+    payload["next_market_state"] = str(snapshot.get("market_state", "N/D"))
+
+    entry_outcome = str(payload.get("entry_outcome") or "").upper()
+    if entry_outcome == "UP":
+        payload["entry_token_id"] = up_token_id
+        if up_price is not None:
+            payload["entry_price_value"] = up_price
+            payload["entry_price"] = format_optional_decimal(up_price, decimals=3)
+            payload["entry_price_source"] = f"gamma:{payload.get('next_slug', '')}"
+    elif entry_outcome == "DOWN":
+        payload["entry_token_id"] = down_token_id
+        if down_price is not None:
+            payload["entry_price_value"] = down_price
+            payload["entry_price"] = format_optional_decimal(down_price, decimals=3)
+            payload["entry_price_source"] = f"gamma:{payload.get('next_slug', '')}"
+    return payload
 
 
 def extract_order_id(payload: object) -> str:
@@ -1609,6 +1660,109 @@ async def command_loop(
                     preview_message,
                     parse_mode=parse_mode,
                     reply_markup=reply_markup,
+                )
+                continue
+
+            if cmd in CURRENT_COMMAND_MAP:
+                crypto, timeframe = CURRENT_COMMAND_MAP[cmd]
+                preset = presets_by_key.get(f"{crypto}-{timeframe}")
+                if preset is None:
+                    continue
+
+                _, w_start, w_end = get_current_window(preset)
+                window_key = w_start.isoformat()
+                now = datetime.now(timezone.utc)
+                seconds_to_end = (w_end - now).total_seconds()
+
+                open_price, _ = resolve_open_price(
+                    preset,
+                    w_start,
+                    w_end,
+                    window_key,
+                    retries=status_api_window_retries,
+                )
+                live_price, _, _ = get_live_price_with_fallback(
+                    preset,
+                    w_start,
+                    w_end,
+                    prices,
+                    now,
+                    max_live_price_age_seconds,
+                )
+
+                current_delta: Optional[float] = None
+                current_dir: Optional[str] = None
+                pattern_label = "N/D"
+                if open_price is not None and live_price is not None:
+                    current_delta = live_price - open_price
+                    current_dir = "UP" if current_delta >= 0 else "DOWN"
+
+                    directions = fetch_last_closed_directions_excluding_current(
+                        preset.db_path,
+                        preset.series_slug,
+                        window_key,
+                        preset.window_seconds,
+                        limit=max_pattern_streak,
+                        audit=[],
+                    )
+                    if len(directions) < max_pattern_streak:
+                        api_directions = fetch_recent_directions_via_api(
+                            preset,
+                            w_start,
+                            limit=max_pattern_streak,
+                            retries_per_window=status_api_window_retries,
+                            audit=[],
+                        )
+                        if len(api_directions) >= len(directions) and api_directions:
+                            directions = api_directions
+
+                    streak_before_current = count_consecutive_directions(
+                        directions,
+                        current_dir,
+                        max_count=max_pattern_streak,
+                    )
+                    pattern_over_limit = streak_before_current >= max_pattern_streak
+                    pattern_count = min(streak_before_current + 1, max_pattern_streak)
+                    pattern_suffix = "+" if pattern_over_limit else ""
+                    pattern_label = f"{current_dir}{pattern_count}{pattern_suffix}"
+
+                preview_data = build_preview_payload(
+                    preset=preset,
+                    w_start=w_start,
+                    w_end=w_end,
+                    seconds_to_end=seconds_to_end,
+                    live_price=live_price,
+                    current_dir=current_dir,
+                    current_delta=current_delta,
+                    operation_pattern=pattern_label,
+                    operation_pattern_trigger=operation_pattern_trigger,
+                    operation_preview_shares=operation_preview_shares,
+                    operation_preview_entry_price=operation_preview_entry_price,
+                    operation_preview_target_profit_pct=operation_preview_target_profit_pct,
+                )
+                preview_data = apply_current_window_snapshot_to_preview(
+                    preview_data,
+                    preset,
+                    w_start,
+                )
+                preview_data, _ = apply_preview_target_to_context(
+                    preview_data,
+                    DEFAULT_PREVIEW_TARGET_CODE,
+                )
+                preview_data = decorate_preview_payload_for_mode(preview_data, trading_mode)
+                preview_message = build_message(preview_template, preview_data)
+                preview_id = build_preview_id(
+                    preset,
+                    w_start,
+                    nonce=f"current-{int(now.timestamp() * 1000)}",
+                )
+                preview_registry[preview_id] = preview_data
+                send_telegram(
+                    token,
+                    str(chat_id),
+                    preview_message,
+                    parse_mode=parse_mode,
+                    reply_markup=build_preview_reply_markup(preview_id),
                 )
                 continue
 

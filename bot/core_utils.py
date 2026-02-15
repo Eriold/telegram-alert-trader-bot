@@ -111,6 +111,15 @@ PREVIEW_COMMAND_MAP = {
     "preview-btc1h": ("BTC", "1h"),
 }
 
+CURRENT_COMMAND_MAP = {
+    "current-eth15": ("ETH", "15m"),
+    "current-eth15m": ("ETH", "15m"),
+    "current-eth1h": ("ETH", "1h"),
+    "current-btc15": ("BTC", "15m"),
+    "current-btc15m": ("BTC", "15m"),
+    "current-btc1h": ("BTC", "1h"),
+}
+
 
 def log_db_read_error_once(db_path: str, exc: Exception) -> None:
     key = (db_path, str(exc))
@@ -1517,24 +1526,24 @@ def build_next_market_slug_candidates(
     return candidates
 
 
-def fetch_next_window_market_snapshot(
+def fetch_window_market_snapshot(
     preset: MonitorPreset,
-    current_window_end: datetime,
+    window_start_utc: datetime,
 ) -> Dict[str, object]:
-    next_start = current_window_end.astimezone(timezone.utc)
-    next_end = next_start + timedelta(seconds=preset.window_seconds)
-    slug_candidates = build_next_market_slug_candidates(preset, next_start)
-    next_slug = slug_candidates[0] if slug_candidates else ""
+    start_utc = window_start_utc.astimezone(timezone.utc)
+    end_utc = start_utc + timedelta(seconds=preset.window_seconds)
+    slug_candidates = build_next_market_slug_candidates(preset, start_utc)
+    primary_slug = slug_candidates[0] if slug_candidates else ""
     snapshot: Dict[str, object] = {
-        "next_slug": next_slug,
-        "next_window_label": f"{dt_to_local_hhmm(next_start)}-{dt_to_local_hhmm(next_end)}",
-        "next_up_price": None,
-        "next_down_price": None,
-        "next_up_token_id": None,
-        "next_down_token_id": None,
-        "next_best_bid": None,
-        "next_best_ask": None,
-        "next_market_state": "N/D",
+        "slug": primary_slug,
+        "window_label": f"{dt_to_local_hhmm(start_utc)}-{dt_to_local_hhmm(end_utc)}",
+        "up_price": None,
+        "down_price": None,
+        "up_token_id": None,
+        "down_token_id": None,
+        "best_bid": None,
+        "best_ask": None,
+        "market_state": "N/D",
     }
     try:
         last_status: Optional[int] = None
@@ -1547,35 +1556,55 @@ def fetch_next_window_market_snapshot(
             market = resp.json() or {}
             up_price, down_price = parse_gamma_up_down_prices(market)
             up_token_id, down_token_id = parse_gamma_up_down_token_ids(market)
-            snapshot["next_slug"] = candidate_slug
-            snapshot["next_up_price"] = up_price
-            snapshot["next_down_price"] = down_price
-            snapshot["next_up_token_id"] = up_token_id
-            snapshot["next_down_token_id"] = down_token_id
-            snapshot["next_best_bid"] = parse_float(str(market.get("bestBid")))
-            snapshot["next_best_ask"] = parse_float(str(market.get("bestAsk")))
+            snapshot["slug"] = candidate_slug
+            snapshot["up_price"] = up_price
+            snapshot["down_price"] = down_price
+            snapshot["up_token_id"] = up_token_id
+            snapshot["down_token_id"] = down_token_id
+            snapshot["best_bid"] = parse_float(str(market.get("bestBid")))
+            snapshot["best_ask"] = parse_float(str(market.get("bestAsk")))
 
             accepting_orders = market.get("acceptingOrders")
             is_active = market.get("active")
             is_closed = market.get("closed")
             if accepting_orders is True:
-                snapshot["next_market_state"] = "OPEN"
+                snapshot["market_state"] = "OPEN"
             elif is_active is True and is_closed is False:
-                snapshot["next_market_state"] = "ACTIVE"
+                snapshot["market_state"] = "ACTIVE"
             elif is_closed is True:
-                snapshot["next_market_state"] = "CLOSED"
+                snapshot["market_state"] = "CLOSED"
             else:
-                snapshot["next_market_state"] = "N/D"
+                snapshot["market_state"] = "N/D"
             return snapshot
 
         if last_status is None:
-            snapshot["next_market_state"] = "unavailable"
+            snapshot["market_state"] = "unavailable"
         else:
-            snapshot["next_market_state"] = f"unavailable ({last_status})"
+            snapshot["market_state"] = f"unavailable ({last_status})"
         return snapshot
     except Exception as exc:
-        snapshot["next_market_state"] = f"error ({exc.__class__.__name__})"
+        snapshot["market_state"] = f"error ({exc.__class__.__name__})"
         return snapshot
+
+
+def fetch_next_window_market_snapshot(
+    preset: MonitorPreset,
+    current_window_end: datetime,
+) -> Dict[str, object]:
+    next_start = current_window_end.astimezone(timezone.utc)
+    raw_snapshot = fetch_window_market_snapshot(preset, next_start)
+    snapshot: Dict[str, object] = {
+        "next_slug": str(raw_snapshot.get("slug", "")),
+        "next_window_label": str(raw_snapshot.get("window_label", "N/D")),
+        "next_up_price": raw_snapshot.get("up_price"),
+        "next_down_price": raw_snapshot.get("down_price"),
+        "next_up_token_id": raw_snapshot.get("up_token_id"),
+        "next_down_token_id": raw_snapshot.get("down_token_id"),
+        "next_best_bid": raw_snapshot.get("best_bid"),
+        "next_best_ask": raw_snapshot.get("best_ask"),
+        "next_market_state": str(raw_snapshot.get("market_state", "N/D")),
+    }
+    return snapshot
 
 
 def build_preview_payload(
