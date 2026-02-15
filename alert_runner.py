@@ -45,6 +45,7 @@ DEFAULT_ENTRY_ORDER_WAIT_SECONDS = 8
 DEFAULT_EXIT_LIMIT_MAX_RETRIES = 3
 DEFAULT_EXIT_LIMIT_RETRY_SECONDS = 1.0
 DEFAULT_EXIT_ORDER_VERIFY_SECONDS = 4
+EXIT_LIMIT_FAILURE_TAG = "[EXIT_LIMIT_RETRY_FAILED]"
 
 
 def resolve_preview_target_code(raw_code: Optional[str]) -> str:
@@ -615,10 +616,42 @@ def place_exit_limit_order_with_retries(
             time.sleep(pause)
 
     raise RuntimeError(
-        "No esta dejando vender "
+        f"{EXIT_LIMIT_FAILURE_TAG} No esta dejando vender "
         f"{size:,.4f} shares al limit {price:.3f} "
         f"tras {attempts} intentos. Ultimo error: {last_error}"
     )
+
+
+def build_live_urgent_exit_limit_failure_message(
+    preview_context: Dict[str, object],
+    error_detail: str,
+    wallet_history_url: str,
+) -> str:
+    market_key = str(preview_context.get("market_key", "N/D"))
+    operation_pattern = str(preview_context.get("operation_pattern", "N/D"))
+    window_label = str(preview_context.get("window_label", "N/D"))
+    shares = parse_int(str(preview_context.get("shares_value")))
+    if shares is None:
+        shares = parse_int(str(preview_context.get("shares")))
+    shares_label = str(shares) if shares is not None else "N/D"
+    target_exit_price = str(preview_context.get("target_exit_price", "N/D"))
+    event_time = dt_to_local_hhmm(datetime.now(timezone.utc))
+    detail_clean = error_detail.replace(EXIT_LIMIT_FAILURE_TAG, "").strip()
+
+    lines = [
+        "<b>🚨 URGENTE: FALLO EN SALIDA LIMIT</b>",
+        f"Hora: {event_time} COL",
+        f"Mercado: {escape_html_text(market_key)}",
+        f"Operacion: {escape_html_text(operation_pattern)}",
+        f"Tramo: {escape_html_text(window_label)}",
+        f"Shares a vender: {escape_html_text(shares_label)}",
+        f"Limit objetivo: {escape_html_text(target_exit_price)}",
+        "Accion requerida: revisar y colocar venta manual inmediata.",
+    ]
+    if wallet_history_url:
+        lines.append(f"Wallet: {escape_html_text(wallet_history_url)}")
+    lines.append(f"Detalle: {escape_html_text(detail_clean)}")
+    return "\n".join(lines)
 
 
 def build_live_entry_message(
@@ -1054,6 +1087,7 @@ async def command_loop(
                                 exit_limit_retry_seconds,
                             )
                         except Exception as exc:
+                            error_text = str(exc)
                             if callback_id:
                                 answer_callback_query(
                                     token,
@@ -1062,12 +1096,25 @@ async def command_loop(
                                     show_alert=True,
                                 )
                             if callback_chat_id is not None:
+                                if EXIT_LIMIT_FAILURE_TAG in error_text:
+                                    urgent_message = build_live_urgent_exit_limit_failure_message(
+                                        preview_context,
+                                        error_text,
+                                        wallet_history_url,
+                                    )
+                                    send_telegram(
+                                        token,
+                                        str(callback_chat_id),
+                                        urgent_message,
+                                        parse_mode=parse_mode,
+                                    )
+                                    continue
                                 send_telegram(
                                     token,
                                     str(callback_chat_id),
                                     (
                                         "<b>Error en ejecucion live</b>\n"
-                                        f"Detalle: {exc}\n"
+                                        f"Detalle: {error_text}\n"
                                         "<i>Si la entrada se ejecuto, revisa y corrige salida manual.</i>"
                                     ),
                                     parse_mode=parse_mode,
