@@ -12,7 +12,6 @@ from py_clob_client.clob_types import (
     ApiCreds,
     AssetType,
     BalanceAllowanceParams,
-    MarketOrderArgs,
     OrderArgs,
     OrderType,
 )
@@ -94,8 +93,11 @@ def normalize_conditional_balance(raw_balance: object) -> Optional[float]:
         return None
     if "." in raw_text:
         return value
-    # CLOB balance_allowance for outcome tokens is returned in 6-decimal base units.
-    return value / 1_000_000.0
+    # CLOB often returns outcome token balance in 6-decimal base units.
+    # For small integer-like values, keep raw value to avoid false underflow.
+    if value > 1000:
+        return value / 1_000_000.0
+    return value
 
 def fetch_outcome_token_balance(
     client: ClobClient,
@@ -121,6 +123,16 @@ def floor_order_size(value: float, decimals: int = DEFAULT_EXIT_SIZE_DECIMALS) -
     precision = max(0, int(decimals))
     factor = 10 ** precision
     return int(max(0.0, float(value)) * factor) / float(factor)
+
+def is_not_enough_balance_error(error_text: str) -> bool:
+    text = str(error_text or "").strip().lower()
+    if not text:
+        return False
+    return (
+        "not enough balance / allowance" in text
+        or ("not enough balance" in text and "allowance" in text)
+        or "insufficient balance" in text
+    )
 
 def init_trading_client(env: Dict[str, str]) -> Tuple[Optional[ClobClient], str, int]:
     host = env.get("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com").strip()
@@ -311,10 +323,15 @@ def place_exit_limit_order_with_retries(
     size: float,
     max_attempts: int,
     retry_seconds: float,
+    signature_type: Optional[int] = None,
 ) -> Tuple[Dict[str, object], str, str, Optional[Dict[str, object]], int]:
     attempts = max(1, int(max_attempts))
     pause = max(0.2, float(retry_seconds))
     last_error = "sin detalle"
+    current_size = floor_order_size(size, decimals=DEFAULT_EXIT_SIZE_DECIMALS)
+    if current_size <= 0:
+        raise RuntimeError("Size de salida invalido para orden limit.")
+    last_size_attempted = current_size
 
     for attempt in range(1, attempts + 1):
         try:
@@ -322,10 +339,11 @@ def place_exit_limit_order_with_retries(
                 OrderArgs(
                     token_id=token_id,
                     price=price,
-                    size=size,
+                    size=current_size,
                     side="SELL",
                 )
             )
+            last_size_attempted = current_size
             exit_response = client.post_order(signed_exit_order, orderType=OrderType.GTC)
             exit_order_id = extract_order_id(exit_response)
             exit_tx_hash = extract_tx_hash(exit_response)
@@ -354,13 +372,39 @@ def place_exit_limit_order_with_retries(
                     )
         except Exception as exc:
             last_error = str(exc)
+            if (
+                signature_type is not None
+                and is_not_enough_balance_error(last_error)
+            ):
+                refreshed_balance = fetch_outcome_token_balance(
+                    client,
+                    signature_type,
+                    token_id,
+                )
+                if refreshed_balance is not None and refreshed_balance > 0:
+                    candidate_size = floor_order_size(
+                        max(0.0, refreshed_balance - 0.000001),
+                        decimals=DEFAULT_EXIT_SIZE_DECIMALS,
+                    )
+                else:
+                    candidate_size = floor_order_size(
+                        current_size * 0.98,
+                        decimals=DEFAULT_EXIT_SIZE_DECIMALS,
+                    )
+                if candidate_size <= 0 or candidate_size >= current_size:
+                    candidate_size = floor_order_size(
+                        current_size * 0.98,
+                        decimals=DEFAULT_EXIT_SIZE_DECIMALS,
+                    )
+                if candidate_size > 0 and candidate_size < current_size:
+                    current_size = candidate_size
 
         if attempt < attempts:
             time.sleep(pause)
 
     raise RuntimeError(
         f"{EXIT_LIMIT_FAILURE_TAG} No esta dejando vender "
-        f"{size:,.4f} shares al limit {price:.3f} "
+        f"{last_size_attempted:,.4f} shares al limit {price:.3f} "
         f"tras {attempts} intentos. Ultimo error: {last_error}"
     )
 
@@ -752,19 +796,20 @@ def execute_live_trade_from_preview(
             f"USD entrada excede maximo permitido ({usd_entry:.2f} > {max_usd_per_trade:.2f})."
         )
 
-    signed_market_order = client.create_market_order(
-        MarketOrderArgs(
+    # Fixed-share entry: send BUY by size (shares), not by USD amount.
+    signed_entry_order = client.create_order(
+        OrderArgs(
             token_id=entry_token_id,
-            amount=usd_entry,
+            price=entry_price,
+            size=float(shares),
             side="BUY",
-            order_type=OrderType.FOK,
         )
     )
-    entry_response = client.post_order(signed_market_order, orderType=OrderType.FOK)
+    entry_response = client.post_order(signed_entry_order, orderType=OrderType.FOK)
     entry_order_id = extract_order_id(entry_response)
     entry_tx_hash = extract_tx_hash(entry_response)
     if not entry_order_id:
-        raise RuntimeError("CLOB no devolvio ID de orden para la entrada market.")
+        raise RuntimeError("CLOB no devolvio ID de orden para la entrada FOK por shares.")
 
     entry_order_status_payload = wait_for_entry_order_result(
         client,
@@ -781,20 +826,23 @@ def execute_live_trade_from_preview(
     if is_order_terminal_without_fill(entry_order_status_payload):
         reason = extract_order_status_text(entry_order_status_payload) or "estado terminal"
         raise RuntimeError(
-            f"Orden de entrada no ejecutada ({reason}). No se envia orden de salida."
+            f"Orden de entrada por shares no ejecutada ({reason}). No se envia orden de salida."
         )
 
     filled_size = extract_filled_size(entry_order_status_payload)
+    if filled_size is None and is_order_filled(entry_order_status_payload):
+        filled_size = float(shares)
     if not is_order_filled(entry_order_status_payload) and (
         filled_size is None or filled_size <= 0
     ):
         raise RuntimeError(
-            "Entrada market sin fill confirmado. No se envia orden limit de salida."
+            "Entrada por shares sin fill confirmado. No se envia orden limit de salida."
         )
 
     exit_size = float(shares)
     if filled_size is not None and filled_size > 0:
         exit_size = filled_size
+    desired_exit_size = exit_size
     available_exit_balance = fetch_outcome_token_balance(
         client,
         signature_type,
@@ -802,19 +850,27 @@ def execute_live_trade_from_preview(
     )
     if available_exit_balance is not None:
         max_sellable = max(0.0, available_exit_balance - 0.000001)
-        exit_size = min(exit_size, max_sellable)
+        adjusted_exit_size = max_sellable
         context["entry_token_balance_available"] = format_optional_decimal(
             available_exit_balance,
             decimals=6,
         )
+        # Strategy: in live mode, always attempt to close full token balance available.
+        adjusted_exit_size = floor_order_size(
+            adjusted_exit_size,
+            decimals=DEFAULT_EXIT_SIZE_DECIMALS,
+        )
+        if adjusted_exit_size > 0:
+            exit_size = adjusted_exit_size
+            context["exit_size_source"] = "full_token_balance"
+        else:
+            context["exit_size_source"] = "filled_or_shares_fallback"
     else:
         context["entry_token_balance_available"] = "N/D"
+        context["exit_size_source"] = "filled_or_shares_fallback"
     exit_size = floor_order_size(exit_size, decimals=DEFAULT_EXIT_SIZE_DECIMALS)
     if exit_size <= 0:
-        raise RuntimeError(
-            "Balance disponible del token de salida es insuficiente; "
-            "no se pudo crear orden limit."
-        )
+        exit_size = floor_order_size(desired_exit_size, decimals=DEFAULT_EXIT_SIZE_DECIMALS)
 
     (
         exit_response,
@@ -829,11 +885,12 @@ def execute_live_trade_from_preview(
         size=exit_size,
         max_attempts=exit_limit_max_retries,
         retry_seconds=exit_limit_retry_seconds,
+        signature_type=signature_type,
     )
 
     executed_at = datetime.now(timezone.utc)
     context["trade_stage"] = "ENTRY_FILLED_EXIT_OPEN"
-    context["entry_mode"] = "MARKET"
+    context["entry_mode"] = "LIMIT_FOK_SIZE"
     context["entry_order_id"] = entry_order_id
     context["entry_tx_hash"] = entry_tx_hash
     context["exit_order_id"] = exit_order_id
