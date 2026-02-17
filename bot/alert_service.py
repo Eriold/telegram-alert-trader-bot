@@ -478,7 +478,7 @@ async def alert_loop():
                         retries_per_window=status_api_window_retries,
                         audit=api_audit,
                     )
-                    if len(api_directions) >= len(directions) and api_directions:
+                    if len(api_directions) > len(directions) and api_directions:
                         directions = api_directions
                         direction_source = "API"
 

@@ -300,6 +300,105 @@ def ensure_live_window_reads_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_candles_table(conn: sqlite3.Connection, table_name: str) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            series_slug TEXT NOT NULL,
+            window_start_utc TEXT NOT NULL,
+            window_end_utc TEXT,
+            open_usd REAL,
+            close_usd REAL,
+            delta_usd REAL,
+            direction TEXT,
+            open_estimated INTEGER NOT NULL DEFAULT 0,
+            close_estimated INTEGER NOT NULL DEFAULT 0,
+            close_from_last_read INTEGER NOT NULL DEFAULT 0,
+            delta_estimated INTEGER NOT NULL DEFAULT 0,
+            updated_at_utc TEXT NOT NULL,
+            PRIMARY KEY (series_slug, window_start_utc)
+        )
+        """
+    )
+
+
+def upsert_closed_window_row(
+    preset: MonitorPreset,
+    row: Dict[str, object],
+) -> None:
+    window_start = row.get("window_start")
+    window_end = row.get("window_end")
+    if not isinstance(window_start, datetime) or not isinstance(window_end, datetime):
+        return
+
+    open_value = parse_float(row.get("open"))  # type: ignore[arg-type]
+    close_value = parse_float(row.get("close"))  # type: ignore[arg-type]
+    if close_value is None:
+        return
+    delta_value = parse_float(row.get("delta"))  # type: ignore[arg-type]
+    if delta_value is None and open_value is not None:
+        delta_value = close_value - open_value
+    direction = direction_from_row_values(open_value, close_value, delta_value)
+
+    open_estimated = bool(row.get("open_estimated"))
+    close_estimated = bool(row.get("close_estimated"))
+    close_from_last_read = bool(row.get("close_from_last_read"))
+    delta_estimated = bool(row.get("delta_estimated"))
+
+    db_path = preset.db_path
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    table_name = resolve_candles_table_name(db_path)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(db_path)
+        ensure_candles_table(conn, table_name)
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {table_name}
+            (
+                series_slug,
+                window_start_utc,
+                window_end_utc,
+                open_usd,
+                close_usd,
+                delta_usd,
+                direction,
+                open_estimated,
+                close_estimated,
+                close_from_last_read,
+                delta_estimated,
+                updated_at_utc
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                preset.series_slug,
+                window_start.astimezone(timezone.utc).isoformat(),
+                window_end.astimezone(timezone.utc).isoformat(),
+                open_value,
+                close_value,
+                delta_value,
+                direction,
+                1 if open_estimated else 0,
+                1 if close_estimated else 0,
+                1 if close_from_last_read else 0,
+                1 if delta_estimated else 0,
+                now_iso,
+            ),
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        log_db_write_error_once(db_path, exc)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     cur = conn.cursor()
     cur.execute(
@@ -312,6 +411,20 @@ def sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
         (table_name,),
     )
     return cur.fetchone() is not None
+
+
+def sqlite_table_columns(conn: sqlite3.Connection, table_name: str) -> Set[str]:
+    cur = conn.cursor()
+    try:
+        cur.execute(f"PRAGMA table_info({table_name})")
+    except sqlite3.Error:
+        return set()
+    rows = cur.fetchall()
+    columns: Set[str] = set()
+    for row in rows:
+        if len(row) > 1:
+            columns.add(str(row[1]))
+    return columns
 
 
 def upsert_last_live_window_read(
@@ -384,37 +497,6 @@ def fetch_last_live_window_read(
             conn.close()
 
 
-def fetch_last_live_window_read_before(
-    db_path: str,
-    series_slug: str,
-    current_start_iso: str,
-) -> Optional[float]:
-    if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
-        return None
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        cur.execute(
-            f"""
-            SELECT last_price_usd
-            FROM {LIVE_WINDOW_READS_TABLE}
-            WHERE series_slug = ?
-              AND window_start_utc < ?
-            ORDER BY window_start_utc DESC
-            LIMIT 1
-            """,
-            (series_slug, current_start_iso),
-        )
-        row = cur.fetchone()
-        return parse_float(row[0]) if row else None
-    except sqlite3.Error:
-        return None
-    finally:
-        if conn is not None:
-            conn.close()
-
-
 def direction_from_row_values(
     open_value: Optional[float],
     close_value: Optional[float],
@@ -456,6 +538,20 @@ def fetch_last_closed_directions_excluding_current(
             if audit is not None:
                 audit.append(f"db_missing_table_{table_name}")
             return []
+        columns = sqlite_table_columns(conn, table_name)
+        estimated_filter = ""
+        if {
+            "open_estimated",
+            "close_estimated",
+            "close_from_last_read",
+            "delta_estimated",
+        }.issubset(columns):
+            estimated_filter = (
+                " AND COALESCE(open_estimated, 0) = 0"
+                " AND COALESCE(close_estimated, 0) = 0"
+                " AND COALESCE(close_from_last_read, 0) = 0"
+                " AND COALESCE(delta_estimated, 0) = 0"
+            )
         cur = conn.cursor()
         query_limit = max(limit * DEFAULT_STATUS_DB_LOOKBACK_MULTIPLIER, limit)
         cur.execute(
@@ -466,6 +562,7 @@ def fetch_last_closed_directions_excluding_current(
               AND direction IN ('UP','DOWN')
               AND series_slug = ?
               AND window_start_utc < ?
+              {estimated_filter}
             ORDER BY window_start_utc DESC
             LIMIT ?
             """,
@@ -512,8 +609,10 @@ def fetch_last_closed_directions_excluding_current(
             conn.close()
 
 
-def fetch_last_close_before(
-    db_path: str, series_slug: str, current_start_iso: str
+def fetch_close_for_window(
+    db_path: str,
+    series_slug: str,
+    window_start_iso: str,
 ) -> Optional[float]:
     if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
         return None
@@ -523,6 +622,16 @@ def fetch_last_close_before(
         conn = sqlite3.connect(db_path)
         if not sqlite_table_exists(conn, table_name):
             return None
+        columns = sqlite_table_columns(conn, table_name)
+        estimated_filter = ""
+        if {
+            "close_estimated",
+            "close_from_last_read",
+        }.issubset(columns):
+            estimated_filter = (
+                " AND COALESCE(close_estimated, 0) = 0"
+                " AND COALESCE(close_from_last_read, 0) = 0"
+            )
         cur = conn.cursor()
         cur.execute(
             f"""
@@ -530,14 +639,14 @@ def fetch_last_close_before(
             FROM {table_name}
             WHERE close_usd IS NOT NULL
               AND series_slug = ?
-              AND window_start_utc < ?
-            ORDER BY window_start_utc DESC
+              AND window_start_utc = ?
+              {estimated_filter}
             LIMIT 1
             """,
-            (series_slug, current_start_iso),
+            (series_slug, window_start_iso),
         )
         row = cur.fetchone()
-        return row[0] if row else None
+        return parse_float(row[0]) if row else None
     except sqlite3.Error as exc:
         log_db_read_error_once(db_path, exc)
         return None
@@ -557,6 +666,16 @@ def fetch_last_closed_rows_db(
         conn = sqlite3.connect(db_path)
         if not sqlite_table_exists(conn, table_name):
             return []
+        columns = sqlite_table_columns(conn, table_name)
+        estimated_filter = ""
+        if {
+            "close_estimated",
+            "close_from_last_read",
+        }.issubset(columns):
+            estimated_filter = (
+                " AND COALESCE(close_estimated, 0) = 0"
+                " AND COALESCE(close_from_last_read, 0) = 0"
+            )
         cur = conn.cursor()
         cur.execute(
             f"""
@@ -565,6 +684,7 @@ def fetch_last_closed_rows_db(
             WHERE close_usd IS NOT NULL
               AND series_slug = ?
               AND window_start_utc < ?
+              {estimated_filter}
             ORDER BY window_start_utc DESC
             LIMIT ?
             """,
@@ -618,6 +738,7 @@ def fetch_recent_directions_via_api(
             retries=max(1, retries_per_window),
             allow_last_read_fallback=False,
             allow_external_price_fallback=False,
+            strict_official_only=True,
         )
         if row is None:
             # Do not skip windows: streak requires contiguous closed sessions.
@@ -699,7 +820,14 @@ def fetch_prev_close_via_api(
     w_end = w_start + timedelta(seconds=preset.window_seconds)
     for _ in range(max(1, retries)):
         try:
-            _, c, _, _ = get_poly_open_close(w_start, w_end, preset.symbol, preset.variant)
+            _, c, _, _ = get_poly_open_close(
+                w_start,
+                w_end,
+                preset.symbol,
+                preset.variant,
+                strict_mode=True,
+                require_completed=True,
+            )
             close_value = parse_float(c)  # type: ignore[arg-type]
             if close_value is not None:
                 return close_value
@@ -852,6 +980,7 @@ def fetch_closed_row_for_window_via_api(
     retries: int,
     allow_last_read_fallback: bool = True,
     allow_external_price_fallback: bool = True,
+    strict_official_only: bool = False,
 ) -> Optional[Dict[str, object]]:
     attempts = max(1, retries)
     variants: List[Optional[str]] = [preset.variant]
@@ -869,7 +998,12 @@ def fetch_closed_row_for_window_via_api(
         for variant in variants:
             try:
                 open_raw, close_raw, _, _ = get_poly_open_close(
-                    window_start, window_end, preset.symbol, variant
+                    window_start,
+                    window_end,
+                    preset.symbol,
+                    variant,
+                    strict_mode=strict_official_only,
+                    require_completed=strict_official_only,
                 )
             except Exception:
                 continue
@@ -918,7 +1052,7 @@ def fetch_closed_row_for_window_via_api(
         delta_value = close_value - open_value
         if close_estimated or open_estimated:
             delta_estimated = True
-    return {
+    row = {
         "open": open_value,
         "close": close_value,
         "delta": delta_value,
@@ -929,6 +1063,8 @@ def fetch_closed_row_for_window_via_api(
         "close_from_last_read": close_from_last_read,
         "delta_estimated": delta_estimated,
     }
+    upsert_closed_window_row(preset, row)
+    return row
 
 
 def should_replace_cached_row(
@@ -1907,10 +2043,17 @@ def resolve_open_price(
 ) -> Tuple[Optional[float], Optional[str]]:
     attempts = max(1, retries)
     close_candidate: Optional[float] = None
+    prev_window_start_iso = (
+        w_start - timedelta(seconds=preset.window_seconds)
+    ).astimezone(timezone.utc).isoformat()
     for _ in range(attempts):
         try:
             open_raw, close_raw, _, _ = get_poly_open_close(
-                w_start, w_end, preset.symbol, preset.variant
+                w_start,
+                w_end,
+                preset.symbol,
+                preset.variant,
+                strict_mode=True,
             )
         except Exception:
             continue
@@ -1921,17 +2064,25 @@ def resolve_open_price(
         if close_candidate is None and close_real is not None:
             close_candidate = close_real
 
-    prev_close = fetch_last_close_before(preset.db_path, preset.series_slug, window_key)
+    prev_close = fetch_close_for_window(
+        preset.db_path,
+        preset.series_slug,
+        prev_window_start_iso,
+    )
     if prev_close is None:
         prev_close = fetch_prev_close_via_api(preset, w_start, retries=attempts)
     if prev_close is not None:
         return prev_close, "PREV_CLOSE"
 
-    live_prev_close = fetch_last_live_window_read_before(
-        preset.db_path, preset.series_slug, window_key
+    # Critical guard: only use temporary last-read from the immediate
+    # previous window. Using "any previous" can invert the live delta sign.
+    live_prev_close = fetch_last_live_window_read(
+        preset.db_path,
+        preset.series_slug,
+        prev_window_start_iso,
     )
     if live_prev_close is not None:
-        return live_prev_close, "LAST_READ"
+        return live_prev_close, "LAST_READ_PREV_WINDOW"
 
     if close_candidate is not None:
         # Last resort when OPEN/PREV_CLOSE are unavailable.
@@ -1977,7 +2128,11 @@ def get_live_price_with_fallback(
     # Fallback a API (close/open de la ventana actual)
     try:
         open_real, close_real, _, _ = get_poly_open_close(
-            w_start, w_end, preset.symbol, preset.variant
+            w_start,
+            w_end,
+            preset.symbol,
+            preset.variant,
+            strict_mode=True,
         )
     except Exception:
         return None, None, "NONE"

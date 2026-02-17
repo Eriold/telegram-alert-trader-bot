@@ -25,6 +25,7 @@ state.json
 datos/
 *.sqlite3
 *.db
+.codex-memory/
 
 # Editor and OS noise
 .vscode/

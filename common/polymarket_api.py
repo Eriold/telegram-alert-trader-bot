@@ -22,6 +22,8 @@ def get_poly_open_close(
     window_end_utc: datetime,
     symbol: str,
     variant: Optional[str] = None,
+    strict_mode: bool = False,
+    require_completed: bool = False,
 ) -> Tuple[Optional[float], Optional[float], bool, datetime]:
     now_utc = datetime.now(timezone.utc)
     window_start_utc = window_start_utc.astimezone(timezone.utc)
@@ -44,15 +46,17 @@ def get_poly_open_close(
             with_variant["variant"] = variant
         request_candidates.append(with_variant)
 
-        without_variant = dict(base_params)
-        without_variant["endDate"] = dt_to_iso_z(used_end)
-        request_candidates.append(without_variant)
+        if not strict_mode:
+            without_variant = dict(base_params)
+            without_variant["endDate"] = dt_to_iso_z(used_end)
+            request_candidates.append(without_variant)
 
     with_variant_no_end = dict(base_params)
     if variant:
         with_variant_no_end["variant"] = variant
     request_candidates.append(with_variant_no_end)
-    request_candidates.append(dict(base_params))
+    if not strict_mode:
+        request_candidates.append(dict(base_params))
 
     last_exc: Optional[Exception] = None
     for params in request_candidates:
@@ -64,6 +68,10 @@ def get_poly_open_close(
             open_p = try_float(j.get("openPrice"))
             close_p = try_float(j.get("closePrice"))
             completed = bool(j.get("completed"))
+            if require_completed and not completed:
+                continue
+            if strict_mode and (open_p is None or close_p is None):
+                continue
             return open_p, close_p, completed, used_end
         except Exception as exc:
             last_exc = exc
