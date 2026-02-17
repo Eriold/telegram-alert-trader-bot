@@ -147,6 +147,8 @@ class WindowState:
     alert_sent: bool = False
     preview_sent: bool = False
     preview_id: Optional[str] = None
+    auto_trade_sent: bool = False
+    auto_trade_pattern: Optional[str] = None
     audit_seen: Set[str] = field(default_factory=set)
 
 
@@ -275,6 +277,8 @@ def persist_window_state(
         "window_key": state.window_key,
         "alert_sent": state.alert_sent,
         "preview_sent": state.preview_sent,
+        "auto_trade_sent": state.auto_trade_sent,
+        "auto_trade_pattern": state.auto_trade_pattern or "",
     }
     save_state(STATE_PATH, state_file)
 
@@ -423,6 +427,15 @@ def direction_from_row_values(
     return "UP" if delta_value >= 0 else "DOWN"
 
 
+def resolve_candles_table_name(db_path: str) -> str:
+    base_name = os.path.basename(str(db_path or "")).strip().lower()
+    stem = os.path.splitext(base_name)[0]
+    normalized = "".join(ch for ch in stem if ch.isalnum())
+    if not normalized:
+        normalized = "candles"
+    return f"{normalized}_candles"
+
+
 def fetch_last_closed_directions_excluding_current(
     db_path: str,
     series_slug: str,
@@ -436,18 +449,19 @@ def fetch_last_closed_directions_excluding_current(
             audit.append("db_unavailable")
         return []
     conn: Optional[sqlite3.Connection] = None
+    table_name = resolve_candles_table_name(db_path)
     try:
         conn = sqlite3.connect(db_path)
-        if not sqlite_table_exists(conn, "eth15m_candles"):
+        if not sqlite_table_exists(conn, table_name):
             if audit is not None:
-                audit.append("db_missing_table_eth15m_candles")
+                audit.append(f"db_missing_table_{table_name}")
             return []
         cur = conn.cursor()
         query_limit = max(limit * DEFAULT_STATUS_DB_LOOKBACK_MULTIPLIER, limit)
         cur.execute(
-            """
+            f"""
             SELECT window_start_utc, direction
-            FROM eth15m_candles
+            FROM {table_name}
             WHERE close_usd IS NOT NULL
               AND direction IN ('UP','DOWN')
               AND series_slug = ?
@@ -504,15 +518,16 @@ def fetch_last_close_before(
     if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
         return None
     conn: Optional[sqlite3.Connection] = None
+    table_name = resolve_candles_table_name(db_path)
     try:
         conn = sqlite3.connect(db_path)
-        if not sqlite_table_exists(conn, "eth15m_candles"):
+        if not sqlite_table_exists(conn, table_name):
             return None
         cur = conn.cursor()
         cur.execute(
-            """
+            f"""
             SELECT close_usd
-            FROM eth15m_candles
+            FROM {table_name}
             WHERE close_usd IS NOT NULL
               AND series_slug = ?
               AND window_start_utc < ?
@@ -537,15 +552,16 @@ def fetch_last_closed_rows_db(
     if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
         return []
     conn: Optional[sqlite3.Connection] = None
+    table_name = resolve_candles_table_name(db_path)
     try:
         conn = sqlite3.connect(db_path)
-        if not sqlite_table_exists(conn, "eth15m_candles"):
+        if not sqlite_table_exists(conn, table_name):
             return []
         cur = conn.cursor()
         cur.execute(
-            """
+            f"""
             SELECT window_start_utc, open_usd, close_usd, delta_usd
-            FROM eth15m_candles
+            FROM {table_name}
             WHERE close_usd IS NOT NULL
               AND series_slug = ?
               AND window_start_utc < ?
@@ -1232,9 +1248,16 @@ async def rtds_price_loop(
     prices: Dict[str, Tuple[float, datetime]],
     target_symbols: set,
     use_proxy: bool = True,
+    inactivity_timeout_seconds: float = 20.0,
+    target_inactivity_timeout_seconds: float = 60.0,
 ):
     proxy_supported: Optional[bool] = None
     reconnect_delay = DEFAULT_WS_RECONNECT_BASE_SECONDS
+    inactivity_timeout = max(5.0, float(inactivity_timeout_seconds))
+    target_inactivity_timeout = max(
+        inactivity_timeout + 5.0,
+        float(target_inactivity_timeout_seconds),
+    )
     while True:
         try:
             ws_ctx = None
@@ -1246,6 +1269,7 @@ async def rtds_price_loop(
                 ws_ctx = websockets.connect(
                     RTDS_WS_URL,
                     ping_interval=None,
+                    open_timeout=15,
                     close_timeout=5,
                     max_size=2**20,
                 )
@@ -1255,6 +1279,7 @@ async def rtds_price_loop(
                         ws_ctx = websockets.connect(
                             RTDS_WS_URL,
                             ping_interval=None,
+                            open_timeout=15,
                             close_timeout=5,
                             max_size=2**20,
                             proxy=proxy_url,
@@ -1266,6 +1291,7 @@ async def rtds_price_loop(
                     ws_ctx = websockets.connect(
                         RTDS_WS_URL,
                         ping_interval=None,
+                        open_timeout=15,
                         close_timeout=5,
                         max_size=2**20,
                         proxy=proxy_url,
@@ -1274,6 +1300,7 @@ async def rtds_price_loop(
                     ws_ctx = websockets.connect(
                         RTDS_WS_URL,
                         ping_interval=None,
+                        open_timeout=15,
                         close_timeout=5,
                         max_size=2**20,
                     )
@@ -1284,7 +1311,21 @@ async def rtds_price_loop(
                 await ws.send(json.dumps(sub))
                 ptask = asyncio.create_task(ping_loop(ws))
                 try:
-                    async for msg in ws:
+                    loop = asyncio.get_running_loop()
+                    last_message_at = loop.time()
+                    last_target_update_at = loop.time()
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(
+                                ws.recv(),
+                                timeout=inactivity_timeout,
+                            )
+                        except asyncio.TimeoutError as exc:
+                            idle = loop.time() - last_message_at
+                            raise RuntimeError(
+                                f"RTDS sin mensajes por {idle:.1f}s; forzando reconexion."
+                            ) from exc
+                        last_message_at = loop.time()
                         if isinstance(msg, (bytes, bytearray)):
                             msg = msg.decode("utf-8", errors="ignore")
                         if not msg:
@@ -1306,6 +1347,12 @@ async def rtds_price_loop(
                             continue
                         sym_norm = norm_symbol(symbol)
                         if sym_norm not in target_symbols:
+                            if (loop.time() - last_target_update_at) > target_inactivity_timeout:
+                                idle_target = loop.time() - last_target_update_at
+                                raise RuntimeError(
+                                    "RTDS activo pero sin updates target "
+                                    f"por {idle_target:.1f}s; reconectando."
+                                )
                             continue
                         value = payload.get("value")
                         ts = payload.get("timestamp")
@@ -1315,6 +1362,7 @@ async def rtds_price_loop(
                         if isinstance(ts, (int, float)):
                             ts_utc = datetime.fromtimestamp(float(ts) / 1000.0, tz=timezone.utc)
                         prices[sym_norm] = (float(value), ts_utc)
+                        last_target_update_at = loop.time()
                 finally:
                     ptask.cancel()
         except Exception as exc:
@@ -1953,6 +2001,16 @@ def telegram_get_updates(token: str, offset: Optional[int], timeout: int) -> Lis
         resp.raise_for_status()
         data = resp.json() or {}
         return data.get("result", []) or []
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 409:
+            print(
+                "Telegram getUpdates conflict (409): "
+                "otra instancia usa el mismo BOT_TOKEN en polling."
+            )
+        else:
+            print(f"Telegram getUpdates error: {exc}")
+        return []
     except Exception as exc:
         print(f"Telegram getUpdates error: {exc}")
         return []

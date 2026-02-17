@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 from bot.command_handler import command_loop
 from bot.core_utils import *
@@ -11,10 +12,16 @@ from bot.live_trading import (
     DEFAULT_EXIT_LIMIT_RETRY_SECONDS,
     DEFAULT_MAX_MARKET_ENTRY_PRICE,
     DEFAULT_ORDER_MONITOR_POLL_SECONDS,
+    EXIT_LIMIT_FAILURE_TAG,
     LIVE_TRADES_STATE_PATH,
+    build_live_entry_message,
+    build_live_urgent_exit_limit_failure_message,
+    execute_live_trade_from_preview,
     init_trading_client,
     load_live_trades_state,
     live_exit_monitor_loop,
+    normalize_usdc_balance,
+    save_live_trades_state,
 )
 from bot.preview_controls import (
     DEFAULT_PREVIEW_TARGET_CODE,
@@ -23,13 +30,16 @@ from bot.preview_controls import (
     build_wallet_history_url,
     decorate_preview_payload_for_mode,
     normalize_trading_mode,
+    resolve_preview_target_code,
 )
 from py_clob_client.client import ClobClient
 
 
 async def alert_loop():
     env = load_env(ENV_PATH)
-    token = env.get("BOT_TOKEN", "")
+    token = (os.environ.get("BOT_TOKEN", "").strip() or env.get("BOT_TOKEN", "").strip())
+    if token:
+        env["BOT_TOKEN"] = token
     chat_ids = parse_chat_ids(env)
     parse_mode = env.get("TELEGRAM_PARSE_MODE", "HTML")
     poll_seconds = float(env.get("POLL_SECONDS", "5"))
@@ -65,6 +75,59 @@ async def alert_loop():
     if operation_preview_target_profit_pct is None:
         operation_preview_target_profit_pct = DEFAULT_OPERATION_PREVIEW_TARGET_PROFIT_PCT
     operation_preview_target_profit_pct = max(0.0, operation_preview_target_profit_pct)
+    auto_trading_enabled = parse_bool(env.get("AUTO_TRADING_ENABLED"), default=False)
+    auto_execution_before_seconds = parse_int(env.get("AUTO_EXECUTION_BEFORE_SECONDS"))
+    if auto_execution_before_seconds is None:
+        auto_execution_before_seconds = 20
+    auto_execution_before_seconds = max(1, auto_execution_before_seconds)
+    auto_execution_after_seconds = parse_int(env.get("AUTO_EXECUTION_AFTER_SECONDS"))
+    if auto_execution_after_seconds is None:
+        auto_execution_after_seconds = 2
+    auto_execution_after_seconds = max(0, auto_execution_after_seconds)
+    if auto_execution_after_seconds >= auto_execution_before_seconds:
+        auto_execution_after_seconds = max(0, auto_execution_before_seconds - 1)
+    auto_scale_execution_before_seconds = parse_int(env.get("AUTO_SCALE_EXECUTION_BEFORE_SECONDS"))
+    if auto_scale_execution_before_seconds is None:
+        auto_scale_execution_before_seconds = 120
+    auto_scale_execution_before_seconds = max(1, auto_scale_execution_before_seconds)
+    auto_scale_execution_after_seconds = parse_int(env.get("AUTO_SCALE_EXECUTION_AFTER_SECONDS"))
+    if auto_scale_execution_after_seconds is None:
+        auto_scale_execution_after_seconds = 50
+    auto_scale_execution_after_seconds = max(0, auto_scale_execution_after_seconds)
+    if auto_scale_execution_after_seconds >= auto_scale_execution_before_seconds:
+        auto_scale_execution_after_seconds = max(0, auto_scale_execution_before_seconds - 1)
+    auto_pattern_start = parse_int(env.get("AUTO_PATTERN_START"))
+    if auto_pattern_start is None:
+        auto_pattern_start = 6
+    auto_pattern_start = max(MIN_PATTERN_TO_ALERT, auto_pattern_start)
+    auto_pattern_max = parse_int(env.get("AUTO_PATTERN_MAX"))
+    if auto_pattern_max is None:
+        auto_pattern_max = 9
+    auto_pattern_max = max(auto_pattern_start, auto_pattern_max)
+    auto_base_shares = parse_int(env.get("AUTO_BASE_SHARES"))
+    if auto_base_shares is None:
+        auto_base_shares = 6
+    auto_base_shares = max(1, auto_base_shares)
+    auto_multiplier = parse_int(env.get("AUTO_SHARES_MULTIPLIER"))
+    if auto_multiplier is None:
+        auto_multiplier = 3
+    auto_multiplier = max(1, auto_multiplier)
+    auto_target_first_code = resolve_preview_target_code(
+        env.get("AUTO_TARGET_FIRST_CODE") or "tp80"
+    )
+    auto_target_scaled_code = resolve_preview_target_code(
+        env.get("AUTO_TARGET_SCALED_CODE") or "tp99"
+    )
+    auto_level6_max_entry_price = parse_float(env.get("AUTO_LEVEL6_MAX_ENTRY_PRICE"))
+    if auto_level6_max_entry_price is None:
+        auto_level6_max_entry_price = 0.57
+    auto_level6_max_entry_price = min(max(0.01, auto_level6_max_entry_price), 0.99)
+    auto_level6_target_spread = parse_float(env.get("AUTO_LEVEL6_TARGET_SPREAD"))
+    if auto_level6_target_spread is None:
+        auto_level6_target_spread = 0.35
+    auto_level6_target_spread = max(0.0, auto_level6_target_spread)
+    if auto_trading_enabled:
+        max_pattern_streak = max(max_pattern_streak, auto_pattern_max)
     configured_trading_mode = normalize_trading_mode(env.get("TRADING_MODE"))
     legacy_live_enabled = parse_bool(env.get("POLYMARKET_ENABLE_TRADING"), default=False)
     live_trading_enabled = parse_bool(
@@ -157,10 +220,37 @@ async def alert_loop():
             "Control entrada market: "
             f"precio_max={max_market_entry_price:.3f}."
         )
+    auto_live_enabled = (
+        auto_trading_enabled
+        and trading_mode == "live"
+        and isinstance(live_client, ClobClient)
+    )
+    if auto_trading_enabled and not auto_live_enabled:
+        print(
+            "AUTO_TRADING_ENABLED=1 pero modo live no disponible; "
+            "auto-trading queda desactivado."
+        )
+    if auto_live_enabled:
+        print(
+            "Auto-trading activo: "
+            f"trigger={auto_pattern_start}-{auto_pattern_max}, "
+            f"ventana_nivel6={auto_execution_before_seconds}s..{auto_execution_after_seconds}s, "
+            f"ventana_escalado={auto_scale_execution_before_seconds}s..{auto_scale_execution_after_seconds}s, "
+            f"base={auto_base_shares}, x{auto_multiplier}, "
+            f"max_entry_n6={auto_level6_max_entry_price:.3f}, "
+            f"spread_n6=+{auto_level6_target_spread:.2f}, "
+            f"tp_base={auto_target_first_code}, tp_escalado={auto_target_scaled_code}."
+        )
 
     startup_message = env.get("STARTUP_MESSAGE", "").strip()
+    auto_startup_message = env.get("AUTO_STARTUP_MESSAGE", "").strip()
+    if auto_live_enabled:
+        if auto_startup_message:
+            startup_message = auto_startup_message
+        elif not startup_message:
+            startup_message = "Bot trader AUTOMATICO iniciado!"
     if not startup_message:
-        startup_message = f"alert_runner iniciado {datetime.now(timezone.utc).isoformat()}"
+        startup_message = "Bot trader MANUAL iniciado!"
     for chat_id in chat_ids:
         send_telegram(token, chat_id, startup_message, parse_mode=parse_mode)
     shutdown_message = env.get("SHUTDOWN_MESSAGE", "").strip()
@@ -179,6 +269,7 @@ async def alert_loop():
         f"{p.symbol}-{p.timeframe_label}": p for p in presets
     }
     window_states: Dict[str, WindowState] = {}
+    auto_cycle_state_by_market: Dict[str, Dict[str, object]] = {}
 
     target_symbols = {norm_symbol(f"{p.symbol}/USD") for p in presets}
     prices: Dict[str, Tuple[float, datetime]] = {}
@@ -258,6 +349,8 @@ async def alert_loop():
                     w_state.alert_sent = False
                     w_state.preview_sent = False
                     w_state.preview_id = None
+                    w_state.auto_trade_sent = False
+                    w_state.auto_trade_pattern = None
                     w_state.audit_seen.clear()
                     saved = state_file.get(key)
                     if (
@@ -272,6 +365,14 @@ async def alert_loop():
                         and saved.get("preview_sent") is True
                     ):
                         w_state.preview_sent = True
+                    if (
+                        isinstance(saved, dict)
+                        and saved.get("window_key") == window_key
+                        and saved.get("auto_trade_sent") is True
+                    ):
+                        w_state.auto_trade_sent = True
+                        auto_pattern_saved = str(saved.get("auto_trade_pattern") or "").strip()
+                        w_state.auto_trade_pattern = auto_pattern_saved or None
 
                 open_value, open_source = resolve_open_price(
                     preset,
@@ -345,7 +446,11 @@ async def alert_loop():
                 if seconds_to_end > alert_before_seconds or seconds_to_end < alert_after_seconds:
                     continue
 
-                if w_state.alert_sent and (not operation_preview_enabled or w_state.preview_sent):
+                skip_alert_preview = (
+                    w_state.alert_sent
+                    and (not operation_preview_enabled or w_state.preview_sent)
+                )
+                if skip_alert_preview and not auto_live_enabled:
                     continue
 
                 # Last closed directions to determine dynamic streak (UPn / DOWNn)
@@ -548,6 +653,260 @@ async def alert_loop():
                             "preview_send_failed",
                             f"Se genero preview para {window_label} pero Telegram no confirmo envio.",
                         )
+
+                if auto_live_enabled and isinstance(live_client, ClobClient):
+                    cycle = auto_cycle_state_by_market.setdefault(
+                        key,
+                        {
+                            "active": False,
+                            "next_level": auto_pattern_start,
+                            "direction": "",
+                            "last_trade_window_key": "",
+                        },
+                    )
+                    cycle_active = bool(cycle.get("active"))
+                    expected_level = parse_int(str(cycle.get("next_level")))
+                    if expected_level is None:
+                        expected_level = auto_pattern_start
+                    cycle_direction = str(cycle.get("direction") or "").strip().upper()
+                    cycle_last_window = str(cycle.get("last_trade_window_key") or "")
+
+                    if (
+                        cycle_active
+                        and expected_level <= auto_pattern_max
+                        and window_key != cycle_last_window
+                        and seconds_to_end <= auto_scale_execution_after_seconds
+                        and (
+                            pattern_count != expected_level
+                            or current_dir != cycle_direction
+                        )
+                    ):
+                        cycle["active"] = False
+                        cycle["next_level"] = auto_pattern_start
+                        cycle["direction"] = ""
+                        cycle["last_trade_window_key"] = ""
+                        audit_log(
+                            alert_audit_logs,
+                            key,
+                            (
+                                f"Auto ciclo reiniciado en {window_label}: "
+                                f"continuidad no confirmada para nivel {expected_level}."
+                            ),
+                        )
+                        cycle_active = False
+                        expected_level = auto_pattern_start
+                        cycle_direction = ""
+                        cycle_last_window = ""
+
+                    auto_level_to_execute: Optional[int] = None
+                    if not w_state.auto_trade_sent:
+                        if not cycle_active:
+                            if (
+                                pattern_count == auto_pattern_start
+                                and seconds_to_end <= auto_execution_before_seconds
+                                and seconds_to_end >= auto_execution_after_seconds
+                            ):
+                                auto_level_to_execute = auto_pattern_start
+                        else:
+                            if (
+                                expected_level <= auto_pattern_max
+                                and window_key != cycle_last_window
+                                and pattern_count == expected_level
+                                and current_dir == cycle_direction
+                                and seconds_to_end <= auto_scale_execution_before_seconds
+                                and seconds_to_end >= auto_scale_execution_after_seconds
+                            ):
+                                auto_level_to_execute = expected_level
+
+                    if auto_level_to_execute is not None:
+                        pattern_step = max(0, auto_level_to_execute - auto_pattern_start)
+                        auto_shares = int(auto_base_shares * (auto_multiplier ** pattern_step))
+                        auto_target_code = (
+                            auto_target_first_code
+                            if auto_level_to_execute == auto_pattern_start
+                            else auto_target_scaled_code
+                        )
+                        auto_target_name = ""
+                        if auto_level_to_execute == auto_pattern_start:
+                            auto_target_name = f"Salida fija +{auto_level6_target_spread:.2f}"
+
+                        auto_preview_data = build_preview_payload(
+                            preset=preset,
+                            w_start=w_start,
+                            w_end=w_end,
+                            seconds_to_end=seconds_to_end,
+                            live_price=live_price,
+                            current_dir=current_dir,
+                            current_delta=current_delta,
+                            operation_pattern=f"AUTO {pattern_label}",
+                            operation_pattern_trigger=operation_pattern_trigger,
+                            operation_preview_shares=auto_shares,
+                            operation_preview_entry_price=operation_preview_entry_price,
+                            operation_preview_target_profit_pct=operation_preview_target_profit_pct,
+                        )
+                        auto_preview_data, default_target_name = apply_preview_target_to_context(
+                            auto_preview_data,
+                            auto_target_code,
+                        )
+                        if not auto_target_name:
+                            auto_target_name = default_target_name
+                        auto_preview_data = decorate_preview_payload_for_mode(auto_preview_data, trading_mode)
+
+                        w_state.auto_trade_sent = True
+                        w_state.auto_trade_pattern = f"{pattern_label}-L{auto_level_to_execute}"
+                        persist_window_state(state_file, key, w_state)
+
+                        auto_notice = (
+                            "<b>AUTO live: ejecucion enviada</b>\n"
+                            f"Mercado: {preset.symbol}-{preset.timeframe_label}\n"
+                            f"Patron: {pattern_label} (nivel {auto_level_to_execute})\n"
+                            f"Entrada: next ({auto_preview_data.get('entry_side', 'N/D')})\n"
+                            f"Shares: {auto_shares}\n"
+                            f"Salida: {auto_target_name}\n"
+                            f"Faltan: {format_seconds(seconds_to_end)}"
+                        )
+                        for chat_id in chat_ids:
+                            send_telegram(
+                                token,
+                                str(chat_id),
+                                auto_notice,
+                                parse_mode=parse_mode,
+                            )
+
+                        try:
+                            live_trade = await asyncio.to_thread(
+                                execute_live_trade_from_preview,
+                                live_client,
+                                auto_preview_data,
+                                auto_target_code,
+                                signature_type_live,
+                                max_shares_per_trade,
+                                max_usd_per_trade,
+                                max_market_entry_price,
+                                wallet_address,
+                                wallet_history_url,
+                                exit_limit_max_retries,
+                                exit_limit_retry_seconds,
+                                entry_token_wait_seconds,
+                                entry_token_poll_seconds,
+                                True,   # force_market_entry
+                                False,  # enforce_risk_limits
+                                auto_level6_max_entry_price
+                                if auto_level_to_execute == auto_pattern_start
+                                else None,
+                                auto_level6_target_spread
+                                if auto_level_to_execute == auto_pattern_start
+                                else None,
+                                auto_target_name
+                                if auto_level_to_execute == auto_pattern_start
+                                else None,
+                            )
+                        except Exception as exc:
+                            error_text = str(exc)
+                            cycle["active"] = False
+                            cycle["next_level"] = auto_pattern_start
+                            cycle["direction"] = ""
+                            cycle["last_trade_window_key"] = ""
+
+                            if "Entrada bloqueada por precio:" in error_text:
+                                skip_message = (
+                                    "<b>AUTO live: entrada cancelada por precio</b>\n"
+                                    f"Mercado: {preset.symbol}-{preset.timeframe_label}\n"
+                                    f"Patron: {pattern_label} (nivel {auto_level_to_execute})\n"
+                                    f"Detalle: {error_text}"
+                                )
+                                for chat_id in chat_ids:
+                                    send_telegram(
+                                        token,
+                                        str(chat_id),
+                                        skip_message,
+                                        parse_mode=parse_mode,
+                                    )
+                            elif EXIT_LIMIT_FAILURE_TAG in error_text:
+                                urgent_message = build_live_urgent_exit_limit_failure_message(
+                                    auto_preview_data,
+                                    error_text,
+                                    wallet_history_url,
+                                )
+                                for chat_id in chat_ids:
+                                    send_telegram(
+                                        token,
+                                        str(chat_id),
+                                        urgent_message,
+                                        parse_mode=parse_mode,
+                                    )
+                            else:
+                                auto_error_message = (
+                                    "<b>Error en auto-trading live</b>\n"
+                                    f"Mercado: {preset.symbol}-{preset.timeframe_label}\n"
+                                    f"Patron: {pattern_label} (nivel {auto_level_to_execute})\n"
+                                    f"Detalle: {error_text}\n"
+                                    "<i>Si la entrada se ejecuto, revisa y corrige salida manual.</i>"
+                                )
+                                for chat_id in chat_ids:
+                                    send_telegram(
+                                        token,
+                                        str(chat_id),
+                                        auto_error_message,
+                                        parse_mode=parse_mode,
+                                    )
+                            audit_log(
+                                alert_audit_logs,
+                                key,
+                                (
+                                    f"Auto-trading fallo en {window_label}: "
+                                    f"patron={pattern_label}, nivel={auto_level_to_execute}, "
+                                    f"shares={auto_shares}, target={auto_target_code}, "
+                                    f"error={error_text}"
+                                ),
+                            )
+                        else:
+                            if auto_level_to_execute < auto_pattern_max:
+                                cycle["active"] = True
+                                cycle["next_level"] = auto_level_to_execute + 1
+                                cycle["direction"] = current_dir
+                                cycle["last_trade_window_key"] = window_key
+                            else:
+                                cycle["active"] = False
+                                cycle["next_level"] = auto_pattern_start
+                                cycle["direction"] = ""
+                                cycle["last_trade_window_key"] = ""
+
+                            trade_stage = str(live_trade.get("trade_stage", "") or "")
+                            if trade_stage != "ENTRY_PENDING_LIMIT":
+                                ts_now = int(datetime.now(timezone.utc).timestamp())
+                                for chat_id in chat_ids:
+                                    trade_copy = dict(live_trade)
+                                    trade_id = (
+                                        f"auto-{key}-L{auto_level_to_execute}-"
+                                        f"{pattern_label}-{ts_now}-{chat_id}"
+                                    )
+                                    trade_copy["trade_id"] = trade_id
+                                    trade_copy["chat_id"] = str(chat_id)
+                                    active_live_trades[trade_id] = trade_copy
+                                save_live_trades_state(LIVE_TRADES_STATE_PATH, active_live_trades)
+
+                            entry_message = build_live_entry_message(
+                                live_trade,
+                                normalize_usdc_balance(live_trade.get("balance_after_entry")),
+                            )
+                            for chat_id in chat_ids:
+                                send_telegram(
+                                    token,
+                                    str(chat_id),
+                                    entry_message,
+                                    parse_mode=parse_mode,
+                                )
+                            audit_log(
+                                alert_audit_logs,
+                                key,
+                                (
+                                    f"Auto-trading ejecutado en {window_label}: "
+                                    f"patron={pattern_label}, nivel={auto_level_to_execute}, "
+                                    f"shares={auto_shares}, target={auto_target_code}, "
+                                    f"stage={trade_stage or 'N/D'}"
+                                ),
+                            )
 
             await asyncio.sleep(poll_seconds)
     finally:

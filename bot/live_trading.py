@@ -12,6 +12,7 @@ from py_clob_client.clob_types import (
     ApiCreds,
     AssetType,
     BalanceAllowanceParams,
+    MarketOrderArgs,
     OrderArgs,
     OrderType,
 )
@@ -123,6 +124,54 @@ def floor_order_size(value: float, decimals: int = DEFAULT_EXIT_SIZE_DECIMALS) -
     precision = max(0, int(decimals))
     factor = 10 ** precision
     return int(max(0.0, float(value)) * factor) / float(factor)
+
+def apply_target_spread_override_to_context(
+    context: Dict[str, object],
+    target_spread: float,
+    target_name: Optional[str] = None,
+) -> Dict[str, object]:
+    output = dict(context)
+    spread = max(0.0, float(target_spread))
+    entry_price = parse_float(str(output.get("entry_price_value")))
+    if entry_price is None:
+        entry_price = parse_float(str(output.get("entry_price")))
+    shares = parse_int(str(output.get("shares_value")))
+    if shares is None:
+        shares = parse_int(str(output.get("shares")))
+    if shares is None:
+        shares = 0
+    if entry_price is None or entry_price <= 0:
+        return output
+
+    target_exit_price = min(max(entry_price + spread, 0.01), 0.99)
+    target_profit_pct = ((target_exit_price / entry_price) - 1.0) * 100.0
+
+    usd_entry: Optional[float] = None
+    usd_exit: Optional[float] = None
+    usd_profit: Optional[float] = None
+    if shares > 0:
+        usd_entry = shares * entry_price
+        usd_exit = shares * target_exit_price
+        usd_profit = usd_exit - usd_entry
+
+    output["target_profile_code"] = "spread"
+    output["target_profile_name"] = (
+        str(target_name).strip()
+        if str(target_name or "").strip()
+        else f"Salida fija +{spread:.2f}"
+    )
+    output["target_profit_pct_value"] = target_profit_pct
+    output["target_exit_price_value"] = target_exit_price
+    output["usd_entry_value"] = usd_entry
+    output["usd_exit_value"] = usd_exit
+    output["usd_profit_value"] = usd_profit
+
+    output["target_profit_pct"] = format_optional_decimal(target_profit_pct, decimals=2)
+    output["target_exit_price"] = format_optional_decimal(target_exit_price, decimals=3)
+    output["usd_entry"] = format_optional_decimal(usd_entry, decimals=2)
+    output["usd_exit"] = format_optional_decimal(usd_exit, decimals=2)
+    output["usd_profit"] = format_optional_decimal(usd_profit, decimals=2)
+    return output
 
 def is_not_enough_balance_error(error_text: str) -> bool:
     text = str(error_text or "").strip().lower()
@@ -662,6 +711,12 @@ def execute_live_trade_from_preview(
     exit_limit_retry_seconds: float,
     entry_token_wait_seconds: int,
     entry_token_poll_seconds: float,
+    force_market_entry: bool = False,
+    enforce_risk_limits: bool = True,
+    max_entry_price_override: Optional[float] = None,
+    target_spread_override: Optional[float] = None,
+    target_override_name: Optional[str] = None,
+    entry_execution_mode: str = "limit_fok_size",
 ) -> Dict[str, object]:
     context, option_name = apply_preview_target_to_context(preview_context, target_code)
     entry_token_id = str(context.get("entry_token_id", "")).strip()
@@ -693,7 +748,7 @@ def execute_live_trade_from_preview(
         shares = parse_int(str(context.get("shares")))
     if shares is None or shares <= 0:
         raise RuntimeError("Shares invalidos para ejecucion live.")
-    if shares > max_shares_per_trade:
+    if enforce_risk_limits and shares > max_shares_per_trade:
         raise RuntimeError(
             f"Shares exceden maximo permitido ({shares} > {max_shares_per_trade})."
         )
@@ -703,6 +758,20 @@ def execute_live_trade_from_preview(
         entry_price = parse_float(str(context.get("entry_price")))
     if entry_price is None or entry_price <= 0:
         raise RuntimeError("Precio de entrada invalido para ejecucion live.")
+    if max_entry_price_override is not None and entry_price > float(max_entry_price_override):
+        raise RuntimeError(
+            f"Entrada bloqueada por precio: {entry_price:.3f} > "
+            f"maximo {float(max_entry_price_override):.3f}."
+        )
+
+    if target_spread_override is not None:
+        context["entry_price_value"] = entry_price
+        context["entry_price"] = format_optional_decimal(entry_price, decimals=3)
+        context = apply_target_spread_override_to_context(
+            context,
+            target_spread=float(target_spread_override),
+            target_name=target_override_name,
+        )
 
     target_exit_price = parse_float(str(context.get("target_exit_price_value")))
     if target_exit_price is None:
@@ -710,9 +779,10 @@ def execute_live_trade_from_preview(
     if target_exit_price is None or target_exit_price <= 0:
         raise RuntimeError("Precio limit de salida invalido.")
     max_market_price = min(max(0.01, float(max_market_entry_price)), 0.99)
-    market_price_too_high = entry_price > max_market_price
+    market_price_too_high = (entry_price > max_market_price) and (not force_market_entry)
 
-    context["target_profile_name"] = option_name
+    if target_spread_override is None:
+        context["target_profile_name"] = option_name
     context["wallet_address"] = wallet_address
     context["wallet_history_url"] = wallet_history_url
     context["shares"] = shares
@@ -725,7 +795,7 @@ def execute_live_trade_from_preview(
     if market_price_too_high:
         entry_limit_price = max_market_price
         usd_entry = shares * entry_limit_price
-        if usd_entry > max_usd_per_trade:
+        if enforce_risk_limits and usd_entry > max_usd_per_trade:
             raise RuntimeError(
                 f"USD entrada limite excede maximo permitido ({usd_entry:.2f} > {max_usd_per_trade:.2f})."
             )
@@ -763,7 +833,14 @@ def execute_live_trade_from_preview(
         context["entry_price"] = format_optional_decimal(entry_limit_price, decimals=3)
         context["entry_price_source"] = "limit_cap"
         context, option_name = apply_preview_target_to_context(context, target_code)
-        context["target_profile_name"] = option_name
+        if target_spread_override is not None:
+            context = apply_target_spread_override_to_context(
+                context,
+                target_spread=float(target_spread_override),
+                target_name=target_override_name,
+            )
+        else:
+            context["target_profile_name"] = option_name
 
         executed_at = datetime.now(timezone.utc)
         context["trade_stage"] = "ENTRY_PENDING_LIMIT"
@@ -791,25 +868,45 @@ def execute_live_trade_from_preview(
         return context
 
     usd_entry = shares * entry_price
-    if usd_entry > max_usd_per_trade:
+    if enforce_risk_limits and usd_entry > max_usd_per_trade:
         raise RuntimeError(
             f"USD entrada excede maximo permitido ({usd_entry:.2f} > {max_usd_per_trade:.2f})."
         )
 
-    # Fixed-share entry: send BUY by size (shares), not by USD amount.
-    signed_entry_order = client.create_order(
-        OrderArgs(
-            token_id=entry_token_id,
-            price=entry_price,
-            size=float(shares),
-            side="BUY",
+    entry_mode_normalized = str(entry_execution_mode or "").strip().lower()
+    use_market_amount_entry = entry_mode_normalized in {
+        "market",
+        "market_amount",
+        "market_fok_amount",
+    }
+
+    if use_market_amount_entry:
+        signed_entry_order = client.create_market_order(
+            MarketOrderArgs(
+                token_id=entry_token_id,
+                amount=usd_entry,
+                side="BUY",
+                order_type=OrderType.FOK,
+            )
         )
-    )
-    entry_response = client.post_order(signed_entry_order, orderType=OrderType.FOK)
+        entry_response = client.post_order(signed_entry_order, orderType=OrderType.FOK)
+        entry_mode_label = "MARKET_FOK_AMOUNT"
+    else:
+        # Fixed-share entry: send BUY by size (shares), not by USD amount.
+        signed_entry_order = client.create_order(
+            OrderArgs(
+                token_id=entry_token_id,
+                price=entry_price,
+                size=float(shares),
+                side="BUY",
+            )
+        )
+        entry_response = client.post_order(signed_entry_order, orderType=OrderType.FOK)
+        entry_mode_label = "LIMIT_FOK_SIZE"
     entry_order_id = extract_order_id(entry_response)
     entry_tx_hash = extract_tx_hash(entry_response)
     if not entry_order_id:
-        raise RuntimeError("CLOB no devolvio ID de orden para la entrada FOK por shares.")
+        raise RuntimeError("CLOB no devolvio ID de orden para la entrada.")
 
     entry_order_status_payload = wait_for_entry_order_result(
         client,
@@ -826,7 +923,7 @@ def execute_live_trade_from_preview(
     if is_order_terminal_without_fill(entry_order_status_payload):
         reason = extract_order_status_text(entry_order_status_payload) or "estado terminal"
         raise RuntimeError(
-            f"Orden de entrada por shares no ejecutada ({reason}). No se envia orden de salida."
+            f"Orden de entrada no ejecutada ({reason}). No se envia orden de salida."
         )
 
     filled_size = extract_filled_size(entry_order_status_payload)
@@ -836,7 +933,7 @@ def execute_live_trade_from_preview(
         filled_size is None or filled_size <= 0
     ):
         raise RuntimeError(
-            "Entrada por shares sin fill confirmado. No se envia orden limit de salida."
+            "Entrada sin fill confirmado. No se envia orden limit de salida."
         )
 
     exit_size = float(shares)
@@ -890,7 +987,7 @@ def execute_live_trade_from_preview(
 
     executed_at = datetime.now(timezone.utc)
     context["trade_stage"] = "ENTRY_FILLED_EXIT_OPEN"
-    context["entry_mode"] = "LIMIT_FOK_SIZE"
+    context["entry_mode"] = entry_mode_label
     context["entry_order_id"] = entry_order_id
     context["entry_tx_hash"] = entry_tx_hash
     context["exit_order_id"] = exit_order_id

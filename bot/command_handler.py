@@ -47,7 +47,11 @@ async def command_loop(
 ):
     token = env.get("BOT_TOKEN", "")
     parse_mode = env.get("TELEGRAM_PARSE_MODE", "HTML")
-    command_poll_seconds = float(env.get("COMMAND_POLL_SECONDS", "2"))
+    command_poll_seconds = max(0.0, float(env.get("COMMAND_POLL_SECONDS", "2")))
+    command_long_poll_timeout = parse_int(env.get("COMMAND_LONG_POLL_TIMEOUT_SECONDS"))
+    if command_long_poll_timeout is None:
+        command_long_poll_timeout = 25
+    command_long_poll_timeout = min(max(1, command_long_poll_timeout), 50)
     history_count = parse_int(env.get("STATUS_HISTORY_COUNT"))
     if history_count is None:
         history_count = DEFAULT_STATUS_HISTORY_COUNT
@@ -117,7 +121,7 @@ async def command_loop(
             telegram_get_updates,
             token,
             (last_update_id + 1) if last_update_id is not None else None,
-            0,
+            command_long_poll_timeout,
         )
 
         for upd in updates:
@@ -211,6 +215,12 @@ async def command_loop(
                                 exit_limit_retry_seconds,
                                 entry_token_wait_seconds,
                                 entry_token_poll_seconds,
+                                False,  # force_market_entry
+                                True,   # enforce_risk_limits
+                                None,   # max_entry_price_override
+                                None,   # target_spread_override
+                                None,   # target_override_name
+                                "market_fok_amount",
                             )
                         except Exception as exc:
                             error_text = str(exc)
@@ -729,4 +739,5 @@ async def command_loop(
                 )
                 continue
 
-        await asyncio.sleep(command_poll_seconds)
+        if not updates and command_poll_seconds > 0:
+            await asyncio.sleep(command_poll_seconds)
