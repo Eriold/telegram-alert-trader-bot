@@ -56,6 +56,9 @@ DEFAULT_STATUS_HISTORY_COUNT = 5
 MAX_STATUS_HISTORY_COUNT = 50
 DEFAULT_STATUS_API_WINDOW_RETRIES = 3
 DEFAULT_STATUS_DB_LOOKBACK_MULTIPLIER = 4
+STATUS_CRITICAL_WINDOW_COUNT = 5
+STATUS_CRITICAL_RETRY_MULTIPLIER = 3
+STATUS_CRITICAL_MIN_RETRIES = 6
 COLOMBIA_FLAG = "\U0001F1E8\U0001F1F4"
 MAX_GAMMA_WINDOW_DRIFT_SECONDS = 120
 DEFAULT_MAX_LIVE_PRICE_AGE_SECONDS = 30
@@ -1639,6 +1642,13 @@ def fetch_status_history_rows(
     if history_count <= 0:
         return []
 
+    base_retries = max(1, api_window_retries)
+    critical_window_count = min(history_count, STATUS_CRITICAL_WINDOW_COUNT)
+    critical_retries = max(
+        base_retries * STATUS_CRITICAL_RETRY_MULTIPLIER,
+        STATUS_CRITICAL_MIN_RETRIES,
+    )
+
     expected_starts = [
         current_window_start - timedelta(seconds=preset.window_seconds * offset)
         for offset in range(1, history_count + 1)
@@ -1663,9 +1673,10 @@ def fetch_status_history_rows(
     cached_rows = STATUS_HISTORY_CACHE.setdefault(cache_key, {})
     output_rows: List[Dict[str, object]] = []
 
-    for start_dt in expected_starts:
+    for idx, start_dt in enumerate(expected_starts):
         end_dt = start_dt + timedelta(seconds=preset.window_seconds)
         start_epoch = int(start_dt.timestamp())
+        row_retries = critical_retries if idx < critical_window_count else base_retries
 
         source_row = db_by_epoch.get(start_epoch)
         if source_row is None:
@@ -1673,7 +1684,7 @@ def fetch_status_history_rows(
                 preset,
                 start_dt,
                 end_dt,
-                retries=api_window_retries,
+                retries=row_retries,
                 allow_last_read_fallback=False,
                 allow_external_price_fallback=False,
                 strict_official_only=True,
@@ -1711,76 +1722,39 @@ def fetch_status_history_rows(
     backfill_history_rows(output_rows)
     apply_close_integrity_corrections(output_rows)
 
-    rows_by_epoch: Dict[int, Dict[str, object]] = {}
-    for row in output_rows:
-        start_epoch = window_epoch(row.get("window_start"))  # type: ignore[arg-type]
-        if start_epoch is None:
-            continue
-        rows_by_epoch[start_epoch] = row
-
-    with_close_count = sum(
-        1
-        for row in output_rows
-        if parse_float(row.get("close")) is not None  # type: ignore[arg-type]
-    )
-    if with_close_count < history_count:
-        # First fill from additional DB rows before attempting API calls.
-        for source_row in db_rows:
-            source_start = source_row.get("window_start")
-            if not isinstance(source_start, datetime):
-                continue
-            start_epoch = int(source_start.timestamp())
-            normalized = normalize_history_row(
-                source_row, source_start, preset.window_seconds
-            )
-            existing = rows_by_epoch.get(start_epoch)
-            if should_replace_cached_row(existing, normalized):
-                rows_by_epoch[start_epoch] = normalized
-
-        with_close_count = sum(
-            1
-            for row in rows_by_epoch.values()
-            if parse_float(row.get("close")) is not None  # type: ignore[arg-type]
-        )
-
-        if with_close_count < history_count:
-            extra_limit = max(
-                history_count * 2,
-                history_count + (history_count - with_close_count),
-            )
-            fallback_rows = fetch_recent_closed_rows_via_api(
-                preset,
-                current_window_start,
-                limit=extra_limit,
-                max_attempts=extra_limit,
-                retries_per_window=max(1, api_window_retries),
-                allow_last_read_fallback=False,
-                allow_external_price_fallback=False,
-                strict_official_only=True,
-            )
-            for source_row in fallback_rows:
-                source_start = source_row.get("window_start")
-                if not isinstance(source_start, datetime):
-                    continue
-                start_epoch = int(source_start.timestamp())
-                normalized = normalize_history_row(
-                    source_row, source_start, preset.window_seconds
+    # Preserve strict contiguous sequence. If a window is still missing,
+    # retry only that exact window instead of replacing it with older rows.
+    missing_indexes = [
+        idx
+        for idx, row in enumerate(output_rows)
+        if parse_float(row.get("close")) is None  # type: ignore[arg-type]
+    ]
+    if missing_indexes:
+        for idx in missing_indexes:
+            start_dt = expected_starts[idx]
+            end_dt = start_dt + timedelta(seconds=preset.window_seconds)
+            start_epoch = int(start_dt.timestamp())
+            row_retries = critical_retries if idx < critical_window_count else base_retries
+            source_row = db_by_epoch.get(start_epoch)
+            if source_row is None:
+                source_row = fetch_closed_row_for_window_via_api(
+                    preset,
+                    start_dt,
+                    end_dt,
+                    retries=max(row_retries, base_retries + 2),
+                    allow_last_read_fallback=False,
+                    allow_external_price_fallback=False,
+                    strict_official_only=True,
                 )
-                existing = rows_by_epoch.get(start_epoch)
-                if should_replace_cached_row(existing, normalized):
-                    rows_by_epoch[start_epoch] = normalized
-
-        ordered_epochs = sorted(rows_by_epoch.keys(), reverse=True)
-        rows_with_close: List[Dict[str, object]] = []
-        rows_without_close: List[Dict[str, object]] = []
-        for start_epoch in ordered_epochs:
-            row = rows_by_epoch[start_epoch]
-            close_value = parse_float(row.get("close"))  # type: ignore[arg-type]
-            if close_value is None:
-                rows_without_close.append(row)
-            else:
-                rows_with_close.append(row)
-        output_rows = (rows_with_close + rows_without_close)[:history_count]
+            if source_row is None:
+                source_row = cached_rows.get(start_epoch)
+            if source_row is None:
+                continue
+            output_rows[idx] = normalize_history_row(
+                source_row,
+                start_dt,
+                preset.window_seconds,
+            )
         backfill_history_rows(output_rows)
         apply_close_integrity_corrections(output_rows)
 

@@ -32,3 +32,5 @@ datos/
 .idea/
 .DS_Store
 Thumbs.db
+
+.alert_runner.lock
