@@ -358,8 +358,9 @@ async def command_loop(
                 )
                 continue
 
-            if cmd in COMMAND_MAP:
-                crypto, timeframe = COMMAND_MAP[cmd]
+            status_base_cmd, status_detailed, status_history_override = resolve_status_command(cmd)
+            if status_base_cmd is not None:
+                crypto, timeframe = COMMAND_MAP[status_base_cmd]
                 preset = presets_by_key.get(f"{crypto}-{timeframe}")
                 if preset is None:
                     continue
@@ -368,14 +369,14 @@ async def command_loop(
                 window_key = w_start.isoformat()
                 now = datetime.now(timezone.utc)
 
-                open_price, _ = resolve_open_price(
+                open_price, open_source = resolve_open_price(
                     preset,
                     w_start,
                     w_end,
                     window_key,
                     retries=status_api_window_retries,
                 )
-                live_price, _, _ = get_live_price_with_fallback(
+                live_price, live_ts, live_source = get_live_price_with_fallback(
                     preset,
                     w_start,
                     w_end,
@@ -383,16 +384,25 @@ async def command_loop(
                     now,
                     max_live_price_age_seconds,
                 )
+                # Estado /reportes: solo aceptar feed RTDS fresco como "Precio actual".
+                if live_source != "RTDS" or live_ts is None:
+                    live_price = None
 
                 history_rows = fetch_status_history_rows(
                     preset,
                     w_start,
-                    history_count,
+                    status_history_override or history_count,
                     api_window_retries=status_api_window_retries,
                 )
 
                 response = build_status_message(
-                    preset, w_start, w_end, live_price, open_price, history_rows
+                    preset,
+                    w_start,
+                    w_end,
+                    live_price,
+                    open_price,
+                    history_rows,
+                    detailed=status_detailed,
                 )
                 send_telegram(token, str(chat_id), response, parse_mode=parse_mode)
                 continue
@@ -436,6 +446,8 @@ async def command_loop(
                         preset.series_slug,
                         window_key,
                         preset.window_seconds,
+                        current_open_value=open_price,
+                        current_open_is_official=(open_source == "OPEN"),
                         limit=max_pattern_streak,
                         audit=[],
                     )
@@ -443,6 +455,8 @@ async def command_loop(
                         api_directions = fetch_recent_directions_via_api(
                             preset,
                             w_start,
+                            current_open_value=open_price,
+                            current_open_is_official=(open_source == "OPEN"),
                             limit=max_pattern_streak,
                             retries_per_window=status_api_window_retries,
                             audit=[],
@@ -507,7 +521,7 @@ async def command_loop(
                 now = datetime.now(timezone.utc)
                 seconds_to_end = (w_end - now).total_seconds()
 
-                open_price, _ = resolve_open_price(
+                open_price, open_source = resolve_open_price(
                     preset,
                     w_start,
                     w_end,
@@ -537,6 +551,8 @@ async def command_loop(
                         preset.series_slug,
                         window_key,
                         preset.window_seconds,
+                        current_open_value=open_price,
+                        current_open_is_official=(open_source == "OPEN"),
                         limit=max_pattern_streak,
                         audit=[],
                     )
@@ -544,6 +560,8 @@ async def command_loop(
                         api_directions = fetch_recent_directions_via_api(
                             preset,
                             w_start,
+                            current_open_value=open_price,
+                            current_open_is_official=(open_source == "OPEN"),
                             limit=max_pattern_streak,
                             retries_per_window=status_api_window_retries,
                             audit=[],

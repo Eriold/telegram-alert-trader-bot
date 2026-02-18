@@ -460,6 +460,8 @@ async def alert_loop():
                     preset.series_slug,
                     window_key,
                     preset.window_seconds,
+                    current_open_value=w_state.open_price,
+                    current_open_is_official=(w_state.open_source == "OPEN"),
                     limit=max_pattern_streak,
                     audit=db_audit,
                 )
@@ -474,6 +476,8 @@ async def alert_loop():
                     api_directions = fetch_recent_directions_via_api(
                         preset,
                         w_start,
+                        current_open_value=w_state.open_price,
+                        current_open_is_official=(w_state.open_source == "OPEN"),
                         limit=max_pattern_streak,
                         retries_per_window=status_api_window_retries,
                         audit=api_audit,

@@ -53,11 +53,13 @@ DEFAULT_OPERATION_PATTERN_TRIGGER = 6
 DEFAULT_OPERATION_PREVIEW_SHARES = 6
 DEFAULT_OPERATION_PREVIEW_TARGET_PROFIT_PCT = 80.0
 DEFAULT_STATUS_HISTORY_COUNT = 5
+MAX_STATUS_HISTORY_COUNT = 50
 DEFAULT_STATUS_API_WINDOW_RETRIES = 3
 DEFAULT_STATUS_DB_LOOKBACK_MULTIPLIER = 4
 COLOMBIA_FLAG = "\U0001F1E8\U0001F1F4"
 MAX_GAMMA_WINDOW_DRIFT_SECONDS = 120
 DEFAULT_MAX_LIVE_PRICE_AGE_SECONDS = 30
+INTEGRITY_CLOSE_DIFF_THRESHOLD = 0.01
 DEFAULT_WS_RECONNECT_BASE_SECONDS = 2.0
 DEFAULT_WS_RECONNECT_MAX_SECONDS = 20.0
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
@@ -119,6 +121,33 @@ CURRENT_COMMAND_MAP = {
     "current-btc15m": ("BTC", "15m"),
     "current-btc1h": ("BTC", "1h"),
 }
+
+
+def resolve_status_command(cmd: str) -> Tuple[Optional[str], bool, Optional[int]]:
+    normalized = str(cmd or "").strip().lower()
+    if not normalized:
+        return None, False, None
+
+    history_override: Optional[int] = None
+    core_token = normalized
+    if "-" in normalized:
+        token_parts = normalized.rsplit("-", 1)
+        if len(token_parts) == 2 and token_parts[1].isdigit():
+            core_token = token_parts[0]
+            history_override = parse_int(token_parts[1])
+            if history_override is not None:
+                history_override = min(
+                    MAX_STATUS_HISTORY_COUNT,
+                    max(1, history_override),
+                )
+
+    if core_token in COMMAND_MAP:
+        return core_token, False, history_override
+    if core_token.endswith("d"):
+        base_cmd = core_token[:-1]
+        if base_cmd in COMMAND_MAP:
+            return base_cmd, True, history_override
+    return None, False, None
 
 
 def log_db_read_error_once(db_path: str, exc: Exception) -> None:
@@ -211,6 +240,54 @@ def parse_bool(value: Optional[str], default: bool) -> bool:
     if raw in ("0", "false", "no", "off"):
         return False
     return default
+
+
+def parse_boolish(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if value is None:
+        return default
+    raw = str(value).strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def infer_open_source(
+    open_value: Optional[float],
+    open_is_official: bool,
+    open_estimated: bool,
+) -> str:
+    if open_value is None:
+        return "open_missing"
+    if open_is_official:
+        return "open_official"
+    if open_estimated:
+        return "open_estimated"
+    return "open_unverified"
+
+
+def infer_close_source(
+    close_value: Optional[float],
+    close_is_official: bool,
+    close_estimated: bool,
+    close_from_last_read: bool,
+) -> str:
+    if close_value is None:
+        return "close_missing"
+    if close_from_last_read:
+        return "last_read_prev_window"
+    if close_is_official:
+        return "close_official"
+    if close_estimated:
+        return "close_estimated"
+    return "close_unverified"
 
 
 def build_thresholds(env: Dict[str, str]) -> Dict[str, Dict[str, float]]:
@@ -523,6 +600,8 @@ def fetch_last_closed_directions_excluding_current(
     series_slug: str,
     current_start_iso: str,
     window_seconds: int,
+    current_open_value: Optional[float] = None,
+    current_open_is_official: bool = False,
     limit: int = 3,
     audit: Optional[List[str]] = None,
 ) -> List[str]:
@@ -539,6 +618,25 @@ def fetch_last_closed_directions_excluding_current(
                 audit.append(f"db_missing_table_{table_name}")
             return []
         columns = sqlite_table_columns(conn, table_name)
+        open_estimated_expr = (
+            "COALESCE(open_estimated, 0)" if "open_estimated" in columns else "0"
+        )
+        close_estimated_expr = (
+            "COALESCE(close_estimated, 0)" if "close_estimated" in columns else "0"
+        )
+        close_from_last_read_expr = (
+            "COALESCE(close_from_last_read, 0)"
+            if "close_from_last_read" in columns
+            else "0"
+        )
+        delta_estimated_expr = (
+            "COALESCE(delta_estimated, 0)" if "delta_estimated" in columns else "0"
+        )
+        open_is_official_expr = (
+            "COALESCE(open_is_official, 0)"
+            if "open_is_official" in columns
+            else f"CASE WHEN {open_estimated_expr} = 0 THEN 1 ELSE 0 END"
+        )
         estimated_filter = ""
         if {
             "open_estimated",
@@ -556,10 +654,18 @@ def fetch_last_closed_directions_excluding_current(
         query_limit = max(limit * DEFAULT_STATUS_DB_LOOKBACK_MULTIPLIER, limit)
         cur.execute(
             f"""
-            SELECT window_start_utc, direction
+            SELECT
+                window_start_utc,
+                open_usd,
+                close_usd,
+                delta_usd,
+                {open_estimated_expr} AS open_estimated,
+                {close_estimated_expr} AS close_estimated,
+                {close_from_last_read_expr} AS close_from_last_read,
+                {delta_estimated_expr} AS delta_estimated,
+                {open_is_official_expr} AS open_is_official
             FROM {table_name}
             WHERE close_usd IS NOT NULL
-              AND direction IN ('UP','DOWN')
               AND series_slug = ?
               AND window_start_utc < ?
               {estimated_filter}
@@ -577,8 +683,24 @@ def fetch_last_closed_directions_excluding_current(
                 audit.append("db_invalid_current_start")
             return []
         expected_epoch = int(current_start.timestamp()) - window_seconds
+        next_open_official = (
+            float(current_open_value)
+            if current_open_is_official and current_open_value is not None
+            else None
+        )
         directions: List[str] = []
-        for row_start_raw, direction in rows:
+        integrity_applied = 0
+        for (
+            row_start_raw,
+            open_raw,
+            close_raw,
+            delta_raw,
+            open_estimated_raw,
+            _close_estimated_raw,
+            _close_from_last_read_raw,
+            _delta_estimated_raw,
+            open_is_official_raw,
+        ) in rows:
             row_start = parse_iso_datetime(row_start_raw)
             if row_start is None:
                 if audit is not None:
@@ -592,12 +714,40 @@ def fetch_last_closed_directions_excluding_current(
                 if audit is not None:
                     audit.append(f"db_gap_expected={expected_epoch}_found={row_epoch}")
                 break
+
+            open_value = parse_float(open_raw)  # type: ignore[arg-type]
+            close_value = parse_float(close_raw)  # type: ignore[arg-type]
+            delta_value = parse_float(delta_raw)  # type: ignore[arg-type]
+
+            open_is_official = parse_boolish(
+                open_is_official_raw,
+                default=(
+                    open_value is not None
+                    and not parse_boolish(open_estimated_raw, default=False)
+                ),
+            )
+            close_final = close_value
+            if next_open_official is not None:
+                if close_value is None or abs(close_value - next_open_official) > 1e-9:
+                    integrity_applied += 1
+                close_final = next_open_official
+            if open_value is not None and close_final is not None:
+                delta_value = close_final - open_value
+
+            direction = direction_from_row_values(open_value, close_final, delta_value)
+            if direction is None:
+                if audit is not None:
+                    audit.append(f"db_missing_direction_at={row_start.isoformat()}")
+                break
             directions.append(direction)
             if len(directions) >= limit:
                 break
+
+            next_open_official = open_value if open_is_official else None
             expected_epoch -= window_seconds
         if audit is not None:
             audit.append(f"db_contiguous_count={len(directions)}")
+            audit.append(f"db_integrity_applied={integrity_applied}")
         return directions
     except sqlite3.Error as exc:
         log_db_read_error_once(db_path, exc)
@@ -667,6 +817,33 @@ def fetch_last_closed_rows_db(
         if not sqlite_table_exists(conn, table_name):
             return []
         columns = sqlite_table_columns(conn, table_name)
+        open_estimated_expr = (
+            "COALESCE(open_estimated, 0)" if "open_estimated" in columns else "0"
+        )
+        close_estimated_expr = (
+            "COALESCE(close_estimated, 0)" if "close_estimated" in columns else "0"
+        )
+        close_from_last_read_expr = (
+            "COALESCE(close_from_last_read, 0)"
+            if "close_from_last_read" in columns
+            else "0"
+        )
+        delta_estimated_expr = (
+            "COALESCE(delta_estimated, 0)" if "delta_estimated" in columns else "0"
+        )
+        open_is_official_expr = (
+            "COALESCE(open_is_official, 0)"
+            if "open_is_official" in columns
+            else f"CASE WHEN {open_estimated_expr} = 0 THEN 1 ELSE 0 END"
+        )
+        close_is_official_expr = (
+            "COALESCE(close_is_official, 0)"
+            if "close_is_official" in columns
+            else (
+                f"CASE WHEN {close_estimated_expr} = 0 "
+                f"AND {close_from_last_read_expr} = 0 THEN 1 ELSE 0 END"
+            )
+        )
         estimated_filter = ""
         if {
             "close_estimated",
@@ -679,7 +856,17 @@ def fetch_last_closed_rows_db(
         cur = conn.cursor()
         cur.execute(
             f"""
-            SELECT window_start_utc, open_usd, close_usd, delta_usd
+            SELECT
+                window_start_utc,
+                open_usd,
+                close_usd,
+                delta_usd,
+                {open_estimated_expr} AS open_estimated,
+                {close_estimated_expr} AS close_estimated,
+                {close_from_last_read_expr} AS close_from_last_read,
+                {delta_estimated_expr} AS delta_estimated,
+                {open_is_official_expr} AS open_is_official,
+                {close_is_official_expr} AS close_is_official
             FROM {table_name}
             WHERE close_usd IS NOT NULL
               AND series_slug = ?
@@ -698,10 +885,34 @@ def fetch_last_closed_rows_db(
         if conn is not None:
             conn.close()
     output: List[Dict[str, object]] = []
-    for window_start_raw, open_usd, close_usd, delta_usd in rows:
-        delta = delta_usd
+    for (
+        window_start_raw,
+        open_raw,
+        close_raw,
+        delta_raw,
+        open_estimated_raw,
+        close_estimated_raw,
+        close_from_last_read_raw,
+        delta_estimated_raw,
+        open_is_official_raw,
+        close_is_official_raw,
+    ) in rows:
+        open_usd = parse_float(open_raw)  # type: ignore[arg-type]
+        close_usd = parse_float(close_raw)  # type: ignore[arg-type]
+        delta = parse_float(delta_raw)  # type: ignore[arg-type]
         if delta is None and open_usd is not None and close_usd is not None:
             delta = close_usd - open_usd
+
+        open_estimated = parse_boolish(open_estimated_raw, default=False)
+        close_estimated = parse_boolish(close_estimated_raw, default=False)
+        close_from_last_read = parse_boolish(close_from_last_read_raw, default=False)
+        delta_estimated = parse_boolish(delta_estimated_raw, default=False)
+        open_is_official = parse_boolish(open_is_official_raw, default=not open_estimated)
+        close_is_official = parse_boolish(
+            close_is_official_raw,
+            default=(not close_estimated and not close_from_last_read),
+        )
+
         window_start = parse_iso_datetime(window_start_raw)
         window_end = (
             window_start + timedelta(seconds=window_seconds)
@@ -713,8 +924,30 @@ def fetch_last_closed_rows_db(
                 "open": open_usd,
                 "close": close_usd,
                 "delta": delta,
+                "direction": direction_from_row_values(open_usd, close_usd, delta),
                 "window_start": window_start,
                 "window_end": window_end,
+                "open_estimated": open_estimated,
+                "close_estimated": close_estimated,
+                "close_from_last_read": close_from_last_read,
+                "delta_estimated": delta_estimated,
+                "open_is_official": open_is_official,
+                "close_is_official": close_is_official,
+                "open_source": infer_open_source(
+                    open_usd,
+                    open_is_official=open_is_official,
+                    open_estimated=open_estimated,
+                ),
+                "close_source": infer_close_source(
+                    close_usd,
+                    close_is_official=close_is_official,
+                    close_estimated=close_estimated,
+                    close_from_last_read=close_from_last_read,
+                ),
+                "close_api": close_usd,
+                "integrity_alert": False,
+                "integrity_diff": None,
+                "integrity_next_open_official": None,
             }
         )
     return output
@@ -723,11 +956,19 @@ def fetch_last_closed_rows_db(
 def fetch_recent_directions_via_api(
     preset: MonitorPreset,
     current_start: datetime,
+    current_open_value: Optional[float] = None,
+    current_open_is_official: bool = False,
     limit: int = 3,
     retries_per_window: int = 1,
     audit: Optional[List[str]] = None,
 ) -> List[str]:
     directions: List[str] = []
+    next_open_official = (
+        float(current_open_value)
+        if current_open_is_official and current_open_value is not None
+        else None
+    )
+    integrity_applied = 0
     for offset in range(1, limit + 1):
         w_start = current_start - timedelta(seconds=offset * preset.window_seconds)
         w_end = w_start + timedelta(seconds=preset.window_seconds)
@@ -760,14 +1001,29 @@ def fetch_recent_directions_via_api(
         open_value = parse_float(row.get("open"))  # type: ignore[arg-type]
         close_value = parse_float(row.get("close"))  # type: ignore[arg-type]
         delta_value = parse_float(row.get("delta"))  # type: ignore[arg-type]
-        direction = direction_from_row_values(open_value, close_value, delta_value)
+        open_is_official = parse_boolish(
+            row.get("open_is_official"),
+            default=(open_value is not None and not bool(row.get("open_estimated"))),
+        )
+
+        close_final = close_value
+        if next_open_official is not None:
+            if close_value is None or abs(close_value - next_open_official) > 1e-9:
+                integrity_applied += 1
+            close_final = next_open_official
+        if open_value is not None and close_final is not None:
+            delta_value = close_final - open_value
+
+        direction = direction_from_row_values(open_value, close_final, delta_value)
         if direction is None:
             if audit is not None:
                 audit.append(f"api_missing_direction_offset={offset}")
             break
         directions.append(direction)
+        next_open_official = open_value if open_is_official else None
     if audit is not None:
         audit.append(f"api_contiguous_count={len(directions)}")
+        audit.append(f"api_integrity_applied={integrity_applied}")
     return directions
 
 
@@ -790,6 +1046,9 @@ def fetch_recent_closed_rows_via_api(
     limit: int = 3,
     max_attempts: int = 12,
     retries_per_window: int = 1,
+    allow_last_read_fallback: bool = True,
+    allow_external_price_fallback: bool = True,
+    strict_official_only: bool = False,
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     offset = 1
@@ -802,7 +1061,9 @@ def fetch_recent_closed_rows_via_api(
             w_start,
             w_end,
             retries=max(1, retries_per_window),
-            allow_last_read_fallback=True,
+            allow_last_read_fallback=allow_last_read_fallback,
+            allow_external_price_fallback=allow_external_price_fallback,
+            strict_official_only=strict_official_only,
         )
         if row is not None:
             rows.append(row)
@@ -906,16 +1167,68 @@ def window_epoch(window_start: Optional[datetime]) -> Optional[int]:
 def normalize_history_row(
     source_row: Dict[str, object], window_start: datetime, window_seconds: int
 ) -> Dict[str, object]:
+    open_value = parse_float(source_row.get("open"))  # type: ignore[arg-type]
+    close_value = parse_float(source_row.get("close"))  # type: ignore[arg-type]
+    delta_value = parse_float(source_row.get("delta"))  # type: ignore[arg-type]
+
+    open_estimated = parse_boolish(source_row.get("open_estimated"), default=False)
+    close_estimated = parse_boolish(source_row.get("close_estimated"), default=False)
+    close_from_last_read = parse_boolish(
+        source_row.get("close_from_last_read"),
+        default=False,
+    )
+    delta_estimated = parse_boolish(source_row.get("delta_estimated"), default=False)
+    open_is_official = parse_boolish(
+        source_row.get("open_is_official"),
+        default=(open_value is not None and not open_estimated),
+    )
+    close_is_official = parse_boolish(
+        source_row.get("close_is_official"),
+        default=(close_value is not None and not close_estimated and not close_from_last_read),
+    )
+
+    open_source = str(source_row.get("open_source") or "").strip()
+    if not open_source:
+        open_source = infer_open_source(
+            open_value,
+            open_is_official=open_is_official,
+            open_estimated=open_estimated,
+        )
+    close_source = str(source_row.get("close_source") or "").strip()
+    if not close_source:
+        close_source = infer_close_source(
+            close_value,
+            close_is_official=close_is_official,
+            close_estimated=close_estimated,
+            close_from_last_read=close_from_last_read,
+        )
+
+    close_api_value = parse_float(source_row.get("close_api"))  # type: ignore[arg-type]
+    if close_api_value is None:
+        close_api_value = close_value
+
     return {
-        "open": parse_float(source_row.get("open")),  # type: ignore[arg-type]
-        "close": parse_float(source_row.get("close")),  # type: ignore[arg-type]
-        "delta": parse_float(source_row.get("delta")),  # type: ignore[arg-type]
+        "open": open_value,
+        "close": close_value,
+        "delta": delta_value,
+        "direction": source_row.get("direction")
+        or direction_from_row_values(open_value, close_value, delta_value),
         "window_start": window_start,
         "window_end": window_start + timedelta(seconds=window_seconds),
-        "open_estimated": bool(source_row.get("open_estimated")),
-        "close_estimated": bool(source_row.get("close_estimated")),
-        "close_from_last_read": bool(source_row.get("close_from_last_read")),
-        "delta_estimated": bool(source_row.get("delta_estimated")),
+        "open_estimated": open_estimated,
+        "close_estimated": close_estimated,
+        "close_from_last_read": close_from_last_read,
+        "delta_estimated": delta_estimated,
+        "open_is_official": open_is_official,
+        "close_is_official": close_is_official,
+        "open_source": open_source,
+        "close_source": close_source,
+        "close_api": close_api_value,
+        "integrity_alert": parse_boolish(source_row.get("integrity_alert"), default=False),
+        "integrity_diff": parse_float(source_row.get("integrity_diff")),  # type: ignore[arg-type]
+        "integrity_next_open_official": parse_float(
+            source_row.get("integrity_next_open_official")
+        ),  # type: ignore[arg-type]
     }
 
 
@@ -1048,20 +1361,46 @@ def fetch_closed_row_for_window_via_api(
 
     delta_value: Optional[float] = None
     delta_estimated = False
+    open_is_official = open_value is not None and not open_estimated
+    close_is_official = (
+        close_value is not None and not close_estimated and not close_from_last_read
+    )
     if open_value is not None and close_value is not None:
         delta_value = close_value - open_value
         if close_estimated or open_estimated:
             delta_estimated = True
+
+    open_source = infer_open_source(
+        open_value,
+        open_is_official=open_is_official,
+        open_estimated=open_estimated,
+    )
+    close_source = infer_close_source(
+        close_value,
+        close_is_official=close_is_official,
+        close_estimated=close_estimated,
+        close_from_last_read=close_from_last_read,
+    )
+
     row = {
         "open": open_value,
         "close": close_value,
         "delta": delta_value,
+        "direction": direction_from_row_values(open_value, close_value, delta_value),
         "window_start": window_start,
         "window_end": window_end,
         "open_estimated": open_estimated,
         "close_estimated": close_estimated,
         "close_from_last_read": close_from_last_read,
         "delta_estimated": delta_estimated,
+        "open_is_official": open_is_official,
+        "close_is_official": close_is_official,
+        "open_source": open_source,
+        "close_source": close_source,
+        "close_api": close_value,
+        "integrity_alert": False,
+        "integrity_diff": None,
+        "integrity_next_open_official": None,
     }
     upsert_closed_window_row(preset, row)
     return row
@@ -1132,6 +1471,8 @@ def backfill_history_rows(rows: List[Dict[str, object]]) -> None:
     for index in range(1, len(rows)):
         newer = rows[index - 1]
         older = rows[index]
+        if not rows_are_contiguous(older, newer):
+            continue
 
         older_close = parse_float(older.get("close"))  # type: ignore[arg-type]
         newer_open = parse_float(newer.get("open"))  # type: ignore[arg-type]
@@ -1139,11 +1480,15 @@ def backfill_history_rows(rows: List[Dict[str, object]]) -> None:
             older["close"] = newer_open
             older["close_estimated"] = True
             older["close_from_last_read"] = False
+            older["close_is_official"] = False
+            older["close_source"] = "next_open_backfill"
             older_close = newer_open
 
         if parse_float(newer.get("open")) is None and older_close is not None:  # type: ignore[arg-type]
             newer["open"] = older_close
             newer["open_estimated"] = True
+            newer["open_is_official"] = False
+            newer["open_source"] = "prev_close_backfill"
 
     # Prefer direct delta (close - open).
     for row in rows:
@@ -1156,6 +1501,11 @@ def backfill_history_rows(rows: List[Dict[str, object]]) -> None:
         row["delta"] = close_value - open_value
         if bool(row.get("close_estimated")) or bool(row.get("open_estimated")):
             row["delta_estimated"] = True
+        row["direction"] = direction_from_row_values(
+            open_value,
+            close_value,
+            parse_float(row.get("delta")),  # type: ignore[arg-type]
+        )
 
     # If delta is still missing, derive it from the previous closed session.
     for index in range(len(rows) - 1):
@@ -1171,6 +1521,113 @@ def backfill_history_rows(rows: List[Dict[str, object]]) -> None:
         if parse_float(row.get("open")) is None:  # type: ignore[arg-type]
             row["open"] = prev_close
             row["open_estimated"] = True
+            row["open_is_official"] = False
+            row["open_source"] = "prev_close_backfill"
+        row["direction"] = direction_from_row_values(
+            parse_float(row.get("open")),  # type: ignore[arg-type]
+            close_value,
+            parse_float(row.get("delta")),  # type: ignore[arg-type]
+        )
+
+
+def rows_are_contiguous(older: Dict[str, object], newer: Dict[str, object]) -> bool:
+    older_end = older.get("window_end")
+    newer_start = newer.get("window_start")
+    if not isinstance(older_end, datetime) or not isinstance(newer_start, datetime):
+        return False
+    older_epoch = int(older_end.astimezone(timezone.utc).timestamp())
+    newer_epoch = int(newer_start.astimezone(timezone.utc).timestamp())
+    return older_epoch == newer_epoch
+
+
+def apply_close_integrity_corrections(rows: List[Dict[str, object]]) -> None:
+    if not rows:
+        return
+
+    for row in rows:
+        if "integrity_alert" not in row:
+            row["integrity_alert"] = False
+        if "integrity_diff" not in row:
+            row["integrity_diff"] = None
+        if "integrity_next_open_official" not in row:
+            row["integrity_next_open_official"] = None
+
+        open_value = parse_float(row.get("open"))  # type: ignore[arg-type]
+        close_value = parse_float(row.get("close"))  # type: ignore[arg-type]
+        close_api_value = parse_float(row.get("close_api"))  # type: ignore[arg-type]
+        if close_api_value is None:
+            close_api_value = close_value
+            row["close_api"] = close_api_value
+
+        open_estimated = parse_boolish(row.get("open_estimated"), default=False)
+        close_estimated = parse_boolish(row.get("close_estimated"), default=False)
+        close_from_last_read = parse_boolish(
+            row.get("close_from_last_read"),
+            default=False,
+        )
+        open_is_official = parse_boolish(
+            row.get("open_is_official"),
+            default=(open_value is not None and not open_estimated),
+        )
+        close_is_official = parse_boolish(
+            row.get("close_is_official"),
+            default=(close_value is not None and not close_estimated and not close_from_last_read),
+        )
+
+        open_source = str(row.get("open_source") or "").strip()
+        if not open_source:
+            row["open_source"] = infer_open_source(
+                open_value,
+                open_is_official=open_is_official,
+                open_estimated=open_estimated,
+            )
+        close_source = str(row.get("close_source") or "").strip()
+        if not close_source:
+            row["close_source"] = infer_close_source(
+                close_value,
+                close_is_official=close_is_official,
+                close_estimated=close_estimated,
+                close_from_last_read=close_from_last_read,
+            )
+
+    for idx in range(1, len(rows)):
+        newer = rows[idx - 1]
+        older = rows[idx]
+        if not rows_are_contiguous(older, newer):
+            continue
+
+        next_open = parse_float(newer.get("open"))  # type: ignore[arg-type]
+        next_open_official = parse_boolish(newer.get("open_is_official"), default=False)
+        if next_open is None or not next_open_official:
+            continue
+
+        close_api = parse_float(older.get("close_api"))  # type: ignore[arg-type]
+        older["close"] = next_open
+        older["close_source"] = "next_open_official"
+        older["close_estimated"] = False
+        older["close_from_last_read"] = False
+        older["close_is_official"] = True
+        older["integrity_next_open_official"] = next_open
+
+        if close_api is not None:
+            diff = abs(close_api - next_open)
+            older["integrity_diff"] = diff
+            older["integrity_alert"] = diff > INTEGRITY_CLOSE_DIFF_THRESHOLD
+        else:
+            older["integrity_diff"] = None
+            older["integrity_alert"] = False
+
+    for row in rows:
+        open_value = parse_float(row.get("open"))  # type: ignore[arg-type]
+        close_value = parse_float(row.get("close"))  # type: ignore[arg-type]
+        delta_value: Optional[float] = None
+        if open_value is not None and close_value is not None:
+            delta_value = close_value - open_value
+        row["delta"] = delta_value
+        row["delta_estimated"] = parse_boolish(
+            row.get("open_estimated"), default=False
+        ) or parse_boolish(row.get("close_estimated"), default=False)
+        row["direction"] = direction_from_row_values(open_value, close_value, delta_value)
 
 
 def fetch_status_history_rows(
@@ -1213,7 +1670,13 @@ def fetch_status_history_rows(
         source_row = db_by_epoch.get(start_epoch)
         if source_row is None:
             source_row = fetch_closed_row_for_window_via_api(
-                preset, start_dt, end_dt, retries=api_window_retries
+                preset,
+                start_dt,
+                end_dt,
+                retries=api_window_retries,
+                allow_last_read_fallback=False,
+                allow_external_price_fallback=False,
+                strict_official_only=True,
             )
         if source_row is None:
             source_row = cached_rows.get(start_epoch)
@@ -1229,6 +1692,15 @@ def fetch_status_history_rows(
                 "close_estimated": False,
                 "close_from_last_read": False,
                 "delta_estimated": False,
+                "open_is_official": False,
+                "close_is_official": False,
+                "open_source": "open_missing",
+                "close_source": "close_missing",
+                "close_api": None,
+                "integrity_alert": False,
+                "integrity_diff": None,
+                "integrity_next_open_official": None,
+                "direction": None,
             }
         else:
             normalized = normalize_history_row(
@@ -1237,6 +1709,7 @@ def fetch_status_history_rows(
         output_rows.append(normalized)
 
     backfill_history_rows(output_rows)
+    apply_close_integrity_corrections(output_rows)
 
     rows_by_epoch: Dict[int, Dict[str, object]] = {}
     for row in output_rows:
@@ -1251,15 +1724,8 @@ def fetch_status_history_rows(
         if parse_float(row.get("close")) is not None  # type: ignore[arg-type]
     )
     if with_close_count < history_count:
-        extra_limit = max(history_count * 4, history_count + (history_count - with_close_count))
-        fallback_rows = fetch_recent_closed_rows_via_api(
-            preset,
-            current_window_start,
-            limit=extra_limit,
-            max_attempts=extra_limit * 3,
-            retries_per_window=max(1, api_window_retries),
-        )
-        for source_row in fallback_rows:
+        # First fill from additional DB rows before attempting API calls.
+        for source_row in db_rows:
             source_start = source_row.get("window_start")
             if not isinstance(source_start, datetime):
                 continue
@@ -1270,6 +1736,39 @@ def fetch_status_history_rows(
             existing = rows_by_epoch.get(start_epoch)
             if should_replace_cached_row(existing, normalized):
                 rows_by_epoch[start_epoch] = normalized
+
+        with_close_count = sum(
+            1
+            for row in rows_by_epoch.values()
+            if parse_float(row.get("close")) is not None  # type: ignore[arg-type]
+        )
+
+        if with_close_count < history_count:
+            extra_limit = max(
+                history_count * 2,
+                history_count + (history_count - with_close_count),
+            )
+            fallback_rows = fetch_recent_closed_rows_via_api(
+                preset,
+                current_window_start,
+                limit=extra_limit,
+                max_attempts=extra_limit,
+                retries_per_window=max(1, api_window_retries),
+                allow_last_read_fallback=False,
+                allow_external_price_fallback=False,
+                strict_official_only=True,
+            )
+            for source_row in fallback_rows:
+                source_start = source_row.get("window_start")
+                if not isinstance(source_start, datetime):
+                    continue
+                start_epoch = int(source_start.timestamp())
+                normalized = normalize_history_row(
+                    source_row, source_start, preset.window_seconds
+                )
+                existing = rows_by_epoch.get(start_epoch)
+                if should_replace_cached_row(existing, normalized):
+                    rows_by_epoch[start_epoch] = normalized
 
         ordered_epochs = sorted(rows_by_epoch.keys(), reverse=True)
         rows_with_close: List[Dict[str, object]] = []
@@ -1283,6 +1782,7 @@ def fetch_status_history_rows(
                 rows_with_close.append(row)
         output_rows = (rows_with_close + rows_without_close)[:history_count]
         backfill_history_rows(output_rows)
+        apply_close_integrity_corrections(output_rows)
 
     for row in output_rows:
         start_epoch = window_epoch(row.get("window_start"))  # type: ignore[arg-type]
@@ -1294,12 +1794,23 @@ def fetch_status_history_rows(
                 "open": parse_float(row.get("open")),  # type: ignore[arg-type]
                 "close": parse_float(row.get("close")),  # type: ignore[arg-type]
                 "delta": parse_float(row.get("delta")),  # type: ignore[arg-type]
+                "direction": row.get("direction"),
                 "window_start": row.get("window_start"),
                 "window_end": row.get("window_end"),
                 "open_estimated": bool(row.get("open_estimated")),
                 "close_estimated": bool(row.get("close_estimated")),
                 "close_from_last_read": bool(row.get("close_from_last_read")),
                 "delta_estimated": bool(row.get("delta_estimated")),
+                "open_is_official": bool(row.get("open_is_official")),
+                "close_is_official": bool(row.get("close_is_official")),
+                "open_source": row.get("open_source"),
+                "close_source": row.get("close_source"),
+                "close_api": parse_float(row.get("close_api")),  # type: ignore[arg-type]
+                "integrity_alert": bool(row.get("integrity_alert")),
+                "integrity_diff": parse_float(row.get("integrity_diff")),  # type: ignore[arg-type]
+                "integrity_next_open_official": parse_float(
+                    row.get("integrity_next_open_official")
+                ),  # type: ignore[arg-type]
             }
 
     if expected_starts:
@@ -1319,6 +1830,7 @@ def build_status_message(
     live_price: Optional[float],
     open_price: Optional[float],
     history_rows: List[Dict[str, object]],
+    detailed: bool = False,
 ) -> str:
     title = (
         f"Resultados para las ultimas {len(history_rows)} sesiones disponibles de "
@@ -1331,13 +1843,19 @@ def build_status_message(
     lines.append(f"Hora live: {dt_to_local_hhmm(datetime.now(timezone.utc))} COL {COLOMBIA_FLAG}")
 
     if live_price is None:
-        lines.append("Precio actual: No disponible")
+        if detailed:
+            lines.append("Precio live no disponible")
+        else:
+            lines.append("Precio actual: No disponible")
     else:
         if open_price is None:
             lines.append(f"Precio actual: {fmt_usd(live_price)} (sin base)")
         else:
             delta = live_price - open_price
             lines.append(f"Precio actual: {fmt_usd(live_price)} {format_delta_with_emoji(delta)}")
+
+    corrected_sessions = 0
+    max_integrity_diff: Optional[float] = None
 
     for row in history_rows:
         session_range = format_session_range(
@@ -1350,6 +1868,15 @@ def build_status_message(
         close_estimated = bool(row.get("close_estimated"))
         close_from_last_read = bool(row.get("close_from_last_read"))
         delta_estimated = bool(row.get("delta_estimated"))
+        open_source = str(row.get("open_source") or "open_unknown")
+        close_source = str(row.get("close_source") or "close_unknown")
+        integrity_alert = bool(row.get("integrity_alert"))
+        integrity_alert_label = "true" if integrity_alert else "false"
+        trace = (
+            f"open_source={open_source}, "
+            f"close_source={close_source}, "
+            f"integrity_alert={integrity_alert_label}"
+        )
         is_estimated = open_estimated or close_estimated or delta_estimated
         status_suffix = ""
         if close_from_last_read:
@@ -1357,16 +1884,69 @@ def build_status_message(
         elif is_estimated:
             status_suffix = " (estimado)"
         if close_usd is None:
-            lines.append(f"{prefix}: No disponible")
-            continue
-        if delta is None:
+            if detailed:
+                lines.append(f"{prefix}: No disponible [{trace}]")
+            else:
+                lines.append(f"{prefix}: No disponible")
+        elif delta is None:
             suffix = status_suffix if status_suffix else " (sin delta)"
-            lines.append(f"{prefix}: {fmt_usd(close_usd)}{suffix}")
-            continue
-        delta_label = format_delta_with_emoji(delta)
-        if status_suffix:
-            delta_label = f"{delta_label}{status_suffix}"
-        lines.append(f"{prefix}: {fmt_usd(close_usd)} {delta_label}")
+            if detailed:
+                lines.append(f"{prefix}: {fmt_usd(close_usd)}{suffix} [{trace}]")
+            else:
+                lines.append(f"{prefix}: {fmt_usd(close_usd)}{suffix}")
+        else:
+            delta_label = format_delta_with_emoji(delta)
+            if status_suffix:
+                delta_label = f"{delta_label}{status_suffix}"
+            if detailed:
+                lines.append(f"{prefix}: {fmt_usd(close_usd)} {delta_label} [{trace}]")
+            else:
+                lines.append(f"{prefix}: {fmt_usd(close_usd)} {delta_label}")
+
+        if integrity_alert:
+            corrected_sessions += 1
+            diff_value_for_summary = parse_float(row.get("integrity_diff"))  # type: ignore[arg-type]
+            if diff_value_for_summary is not None:
+                if max_integrity_diff is None or diff_value_for_summary > max_integrity_diff:
+                    max_integrity_diff = diff_value_for_summary
+            if not detailed:
+                continue
+
+            window_start = row.get("window_start")
+            if isinstance(window_start, datetime):
+                window_start_label = window_start.astimezone(timezone.utc).isoformat()
+            else:
+                window_start_label = "N/D"
+
+            close_api_value = parse_float(row.get("close_api"))  # type: ignore[arg-type]
+            next_open_official = parse_float(
+                row.get("integrity_next_open_official")
+            )  # type: ignore[arg-type]
+            close_used = parse_float(row.get("close"))  # type: ignore[arg-type]
+            diff_value = parse_float(row.get("integrity_diff"))  # type: ignore[arg-type]
+
+            lines.append(
+                f"[ALERTA_INTEGRIDAD] {preset.symbol} {preset.timeframe_label} "
+                f"{window_start_label}: "
+                f"close_api={format_optional_decimal(close_api_value)}, "
+                f"next_open_official={format_optional_decimal(next_open_official)}, "
+                f"close_usado={format_optional_decimal(close_used)}, "
+                f"diff={format_optional_decimal(diff_value)}"
+            )
+
+    if not detailed and corrected_sessions > 0:
+        detail_cmd = f"/{preset.symbol.lower()}{preset.timeframe_label}D"
+        if max_integrity_diff is not None:
+            diff_label = f"{max_integrity_diff:,.2f}"
+            lines.append(
+                f"Integridad OPEN/CLOSE aplicada en {corrected_sessions} sesiones "
+                f"(max diff={diff_label}). Detalle: {detail_cmd}"
+            )
+        else:
+            lines.append(
+                f"Integridad OPEN/CLOSE aplicada en {corrected_sessions} sesiones. "
+                f"Detalle: {detail_cmd}"
+            )
 
     return "\n".join(lines)
 
