@@ -6,6 +6,7 @@ from bot.core_utils import *
 
 PREVIEW_CALLBACK_SEPARATOR = "|"
 DEFAULT_PREVIEW_TARGET_CODE = "tp80"
+PREVIEW_CANCEL_CODE = "cancel"
 PREVIEW_TARGET_OPTIONS: Dict[str, Dict[str, object]] = {
     "tp70": {
         "button": "⚪ Salir 0.70",
@@ -53,12 +54,26 @@ def build_preview_reply_markup(preview_id: str) -> Dict[str, object]:
                 }
             ]
         )
+    rows.append(
+        [
+            {
+                "text": "Cancelar",
+                "callback_data": (
+                    f"{PREVIEW_CALLBACK_PREFIX}{preview_id}"
+                    f"{PREVIEW_CALLBACK_SEPARATOR}{PREVIEW_CANCEL_CODE}"
+                ),
+            }
+        ]
+    )
     return {"inline_keyboard": rows}
 
 def parse_preview_callback_data(callback_data: str) -> Tuple[str, str]:
     payload = callback_data[len(PREVIEW_CALLBACK_PREFIX) :]
     if PREVIEW_CALLBACK_SEPARATOR in payload:
         preview_id, raw_target_code = payload.split(PREVIEW_CALLBACK_SEPARATOR, 1)
+        normalized_code = str(raw_target_code or "").strip().lower()
+        if normalized_code == PREVIEW_CANCEL_CODE:
+            return preview_id, PREVIEW_CANCEL_CODE
         return preview_id, resolve_preview_target_code(raw_target_code)
     return payload, DEFAULT_PREVIEW_TARGET_CODE
 
@@ -195,7 +210,7 @@ def build_help_message(trading_mode: str) -> str:
         "<code>/current-eth1h</code> -> Crea preview para operar la vela actual ETH 1h\n"
         "<code>/current-btc15m</code> -> Crea preview para operar la vela actual BTC 15m\n"
         "<code>/current-btc1h</code> -> Crea preview para operar la vela actual BTC 1h\n"
-        "Botones de salida fija en cada preview: <code>0.70</code>, <code>0.80</code>, <code>0.99</code>\n\n"
+        "Botones de salida fija en cada preview: <code>0.70</code>, <code>0.80</code>, <code>0.99</code> y <code>Cancelar</code>\n\n"
         "<b>Operar Manualmente</b>\n"
         "<code>/{mercado}-{lado}-sha-{shares}-V-{precio|market}[-tp-{70|80|99}]-{next|now}</code>\n"
         "Genera un preview manual para confirmar por botones.\n"
@@ -314,12 +329,14 @@ def decorate_preview_payload_for_mode(
         payload["preview_footer"] = (
             "Al confirmar, el bot enviara orden REAL (market + limit) "
             f"sobre {scope_label}, segun el boton 70%/80%/0.99. "
+            "Boton Cancelar disponible para abortar. "
             "Primer clic bloquea el preview."
         )
     else:
         payload["preview_mode_badge"] = "CURRENT PREVIEW" if scope == "current" else "PREVIEW"
         payload["preview_footer"] = (
             "Botones 70%/80%/0.99 activos solo para simulacion. "
+            "Boton Cancelar disponible para abortar. "
             f"Entrada objetivo: {scope_label}. "
             "No ejecuta ordenes reales. Primer clic bloquea el preview."
         )

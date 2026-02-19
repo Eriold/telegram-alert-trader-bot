@@ -18,7 +18,11 @@ if ROOT_DIR not in sys.path:
 from common.config import GAMMA_BASE, PING_EVERY_SECONDS, RTDS_TOPIC, RTDS_WS_URL
 from common.gamma_api import get_current_window_from_gamma, slug_for_start_epoch
 from common.monitor_presets import MonitorPreset, get_preset
-from common.polymarket_api import get_poly_open_close
+from common.polymarket_api import (
+    PRICE_SOURCE_BINANCE_PROXY,
+    PRICE_SOURCE_POLYMARKET,
+    get_poly_open_close,
+)
 from common.utils import (
     dt_to_local_hhmm,
     floor_to_window_epoch,
@@ -293,6 +297,51 @@ def infer_close_source(
     return "close_unverified"
 
 
+def source_is_official(source: Optional[str]) -> bool:
+    return str(source or "").strip().lower() == PRICE_SOURCE_POLYMARKET
+
+
+def row_is_provisional(row: Dict[str, object]) -> bool:
+    open_value = parse_float(row.get("open"))  # type: ignore[arg-type]
+    close_value = parse_float(row.get("close"))  # type: ignore[arg-type]
+    if open_value is None or close_value is None:
+        return True
+
+    open_estimated = parse_boolish(row.get("open_estimated"), default=False)
+    close_estimated = parse_boolish(row.get("close_estimated"), default=False)
+    close_from_last_read = parse_boolish(row.get("close_from_last_read"), default=False)
+    open_is_official = parse_boolish(
+        row.get("open_is_official"),
+        default=(open_value is not None and not open_estimated),
+    )
+    close_is_official = parse_boolish(
+        row.get("close_is_official"),
+        default=(close_value is not None and not close_estimated and not close_from_last_read),
+    )
+    return not (open_is_official and close_is_official)
+
+
+def format_price_with_source_suffix(value: Optional[float], is_official: bool) -> str:
+    if value is None:
+        return "No encontrado"
+    label = fmt_usd(value)
+    if is_official:
+        return label
+    return f"{label} P"
+
+
+def format_live_price_label(value: Optional[float], live_source: str) -> str:
+    if value is None:
+        return "No encontrado"
+    label = fmt_usd(value)
+    source_upper = str(live_source or "").strip().upper()
+    if source_upper == "RTDS":
+        return label
+    if "BINANCE" in source_upper:
+        return f"{label} B"
+    return f"{label} P"
+
+
 def build_thresholds(env: Dict[str, str]) -> Dict[str, Dict[str, float]]:
     thresholds = {
         "15m": {"ETH": THRESHOLDS["15m"]["ETH"], "BTC": THRESHOLDS["15m"]["BTC"]},
@@ -396,11 +445,26 @@ def ensure_candles_table(conn: sqlite3.Connection, table_name: str) -> None:
             close_estimated INTEGER NOT NULL DEFAULT 0,
             close_from_last_read INTEGER NOT NULL DEFAULT 0,
             delta_estimated INTEGER NOT NULL DEFAULT 0,
+            open_is_official INTEGER NOT NULL DEFAULT 0,
+            close_is_official INTEGER NOT NULL DEFAULT 0,
+            open_source TEXT,
+            close_source TEXT,
             updated_at_utc TEXT NOT NULL,
             PRIMARY KEY (series_slug, window_start_utc)
         )
         """
     )
+    columns = sqlite_table_columns(conn, table_name)
+    required_columns = {
+        "open_is_official": "INTEGER NOT NULL DEFAULT 0",
+        "close_is_official": "INTEGER NOT NULL DEFAULT 0",
+        "open_source": "TEXT",
+        "close_source": "TEXT",
+    }
+    for column_name, ddl in required_columns.items():
+        if column_name in columns:
+            continue
+        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
 
 
 def upsert_closed_window_row(
@@ -414,17 +478,42 @@ def upsert_closed_window_row(
 
     open_value = parse_float(row.get("open"))  # type: ignore[arg-type]
     close_value = parse_float(row.get("close"))  # type: ignore[arg-type]
-    if close_value is None:
-        return
     delta_value = parse_float(row.get("delta"))  # type: ignore[arg-type]
-    if delta_value is None and open_value is not None:
-        delta_value = close_value - open_value
-    direction = direction_from_row_values(open_value, close_value, delta_value)
 
-    open_estimated = bool(row.get("open_estimated"))
-    close_estimated = bool(row.get("close_estimated"))
-    close_from_last_read = bool(row.get("close_from_last_read"))
-    delta_estimated = bool(row.get("delta_estimated"))
+    open_estimated = parse_boolish(row.get("open_estimated"), default=False)
+    close_estimated = parse_boolish(row.get("close_estimated"), default=False)
+    close_from_last_read = parse_boolish(row.get("close_from_last_read"), default=False)
+    delta_estimated = parse_boolish(row.get("delta_estimated"), default=False)
+    open_is_official = parse_boolish(
+        row.get("open_is_official"),
+        default=(open_value is not None and not open_estimated),
+    )
+    close_is_official = parse_boolish(
+        row.get("close_is_official"),
+        default=(close_value is not None and not close_estimated and not close_from_last_read),
+    )
+    open_source = str(row.get("open_source") or "").strip()
+    if not open_source:
+        open_source = infer_open_source(
+            open_value,
+            open_is_official=open_is_official,
+            open_estimated=open_estimated,
+        )
+    close_source = str(row.get("close_source") or "").strip()
+    if not close_source:
+        close_source = infer_close_source(
+            close_value,
+            close_is_official=close_is_official,
+            close_estimated=close_estimated,
+            close_from_last_read=close_from_last_read,
+        )
+    if source_is_official(open_source):
+        open_estimated = False
+        open_is_official = open_value is not None
+    if source_is_official(close_source):
+        close_estimated = False
+        close_from_last_read = False
+        close_is_official = close_value is not None
 
     db_path = preset.db_path
     db_dir = os.path.dirname(db_path)
@@ -433,10 +522,133 @@ def upsert_closed_window_row(
 
     table_name = resolve_candles_table_name(db_path)
     now_iso = datetime.now(timezone.utc).isoformat()
+    window_start_iso = window_start.astimezone(timezone.utc).isoformat()
+    window_end_iso = window_end.astimezone(timezone.utc).isoformat()
     conn: Optional[sqlite3.Connection] = None
     try:
         conn = sqlite3.connect(db_path)
         ensure_candles_table(conn, table_name)
+        columns = sqlite_table_columns(conn, table_name)
+        open_is_official_expr = (
+            "COALESCE(open_is_official, 0)"
+            if "open_is_official" in columns
+            else "CASE WHEN COALESCE(open_estimated, 0) = 0 THEN 1 ELSE 0 END"
+        )
+        close_is_official_expr = (
+            "COALESCE(close_is_official, 0)"
+            if "close_is_official" in columns
+            else (
+                "CASE WHEN COALESCE(close_estimated, 0) = 0 "
+                "AND COALESCE(close_from_last_read, 0) = 0 THEN 1 ELSE 0 END"
+            )
+        )
+        open_source_expr = "COALESCE(open_source, '')" if "open_source" in columns else "''"
+        close_source_expr = "COALESCE(close_source, '')" if "close_source" in columns else "''"
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT
+                open_usd,
+                close_usd,
+                delta_usd,
+                direction,
+                COALESCE(open_estimated, 0),
+                COALESCE(close_estimated, 0),
+                COALESCE(close_from_last_read, 0),
+                COALESCE(delta_estimated, 0),
+                {open_is_official_expr} AS open_is_official,
+                {close_is_official_expr} AS close_is_official,
+                {open_source_expr} AS open_source,
+                {close_source_expr} AS close_source
+            FROM {table_name}
+            WHERE series_slug = ?
+              AND window_start_utc = ?
+            LIMIT 1
+            """,
+            (preset.series_slug, window_start_iso),
+        )
+        existing = cur.fetchone()
+        if existing:
+            existing_open = parse_float(existing[0])
+            existing_close = parse_float(existing[1])
+            existing_delta = parse_float(existing[2])
+            existing_open_estimated = parse_boolish(existing[4], default=False)
+            existing_close_estimated = parse_boolish(existing[5], default=False)
+            existing_close_from_last_read = parse_boolish(existing[6], default=False)
+            existing_delta_estimated = parse_boolish(existing[7], default=False)
+            existing_open_is_official = parse_boolish(
+                existing[8],
+                default=(existing_open is not None and not existing_open_estimated),
+            )
+            existing_close_is_official = parse_boolish(
+                existing[9],
+                default=(
+                    existing_close is not None
+                    and not existing_close_estimated
+                    and not existing_close_from_last_read
+                ),
+            )
+            existing_open_source = str(existing[10] or "").strip()
+            existing_close_source = str(existing[11] or "").strip()
+
+            # Keep existing non-null values when incoming payload is null-ish.
+            if open_value is None and existing_open is not None:
+                open_value = existing_open
+                open_estimated = existing_open_estimated
+                open_is_official = existing_open_is_official
+                open_source = existing_open_source or infer_open_source(
+                    existing_open,
+                    open_is_official=existing_open_is_official,
+                    open_estimated=existing_open_estimated,
+                )
+            if close_value is None and existing_close is not None:
+                close_value = existing_close
+                close_estimated = existing_close_estimated
+                close_from_last_read = existing_close_from_last_read
+                close_is_official = existing_close_is_official
+                close_source = existing_close_source or infer_close_source(
+                    existing_close,
+                    close_is_official=existing_close_is_official,
+                    close_estimated=existing_close_estimated,
+                    close_from_last_read=existing_close_from_last_read,
+                )
+
+            # Never degrade an official value to proxy/unverified.
+            if existing_open_is_official and not open_is_official and existing_open is not None:
+                open_value = existing_open
+                open_estimated = existing_open_estimated
+                open_is_official = True
+                open_source = existing_open_source or PRICE_SOURCE_POLYMARKET
+            if existing_close_is_official and not close_is_official and existing_close is not None:
+                close_value = existing_close
+                close_estimated = existing_close_estimated
+                close_from_last_read = existing_close_from_last_read
+                close_is_official = True
+                close_source = existing_close_source or PRICE_SOURCE_POLYMARKET
+
+            if delta_value is None and existing_delta is not None:
+                same_open = (
+                    open_value is not None
+                    and existing_open is not None
+                    and abs(open_value - existing_open) <= 1e-9
+                )
+                same_close = (
+                    close_value is not None
+                    and existing_close is not None
+                    and abs(close_value - existing_close) <= 1e-9
+                )
+                if same_open and same_close:
+                    delta_value = existing_delta
+                    delta_estimated = existing_delta_estimated
+
+        if close_value is None:
+            return
+        if delta_value is None and open_value is not None:
+            delta_value = close_value - open_value
+        if open_value is not None and close_value is not None:
+            delta_estimated = delta_estimated or open_estimated or close_estimated
+        direction = direction_from_row_values(open_value, close_value, delta_value)
+
         conn.execute(
             f"""
             INSERT OR REPLACE INTO {table_name}
@@ -452,14 +664,18 @@ def upsert_closed_window_row(
                 close_estimated,
                 close_from_last_read,
                 delta_estimated,
+                open_is_official,
+                close_is_official,
+                open_source,
+                close_source,
                 updated_at_utc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 preset.series_slug,
-                window_start.astimezone(timezone.utc).isoformat(),
-                window_end.astimezone(timezone.utc).isoformat(),
+                window_start_iso,
+                window_end_iso,
                 open_value,
                 close_value,
                 delta_value,
@@ -468,6 +684,10 @@ def upsert_closed_window_row(
                 1 if close_estimated else 0,
                 1 if close_from_last_read else 0,
                 1 if delta_estimated else 0,
+                1 if open_is_official else 0,
+                1 if close_is_official else 0,
+                open_source,
+                close_source,
                 now_iso,
             ),
         )
@@ -847,15 +1067,10 @@ def fetch_last_closed_rows_db(
                 f"AND {close_from_last_read_expr} = 0 THEN 1 ELSE 0 END"
             )
         )
-        estimated_filter = ""
-        if {
-            "close_estimated",
-            "close_from_last_read",
-        }.issubset(columns):
-            estimated_filter = (
-                " AND COALESCE(close_estimated, 0) = 0"
-                " AND COALESCE(close_from_last_read, 0) = 0"
-            )
+        open_source_expr = "COALESCE(open_source, '')" if "open_source" in columns else "''"
+        close_source_expr = (
+            "COALESCE(close_source, '')" if "close_source" in columns else "''"
+        )
         cur = conn.cursor()
         cur.execute(
             f"""
@@ -869,12 +1084,13 @@ def fetch_last_closed_rows_db(
                 {close_from_last_read_expr} AS close_from_last_read,
                 {delta_estimated_expr} AS delta_estimated,
                 {open_is_official_expr} AS open_is_official,
-                {close_is_official_expr} AS close_is_official
+                {close_is_official_expr} AS close_is_official,
+                {open_source_expr} AS open_source,
+                {close_source_expr} AS close_source
             FROM {table_name}
             WHERE close_usd IS NOT NULL
               AND series_slug = ?
               AND window_start_utc < ?
-              {estimated_filter}
             ORDER BY window_start_utc DESC
             LIMIT ?
             """,
@@ -899,6 +1115,8 @@ def fetch_last_closed_rows_db(
         delta_estimated_raw,
         open_is_official_raw,
         close_is_official_raw,
+        open_source_raw,
+        close_source_raw,
     ) in rows:
         open_usd = parse_float(open_raw)  # type: ignore[arg-type]
         close_usd = parse_float(close_raw)  # type: ignore[arg-type]
@@ -915,6 +1133,21 @@ def fetch_last_closed_rows_db(
             close_is_official_raw,
             default=(not close_estimated and not close_from_last_read),
         )
+        open_source = str(open_source_raw or "").strip()
+        if not open_source:
+            open_source = infer_open_source(
+                open_usd,
+                open_is_official=open_is_official,
+                open_estimated=open_estimated,
+            )
+        close_source = str(close_source_raw or "").strip()
+        if not close_source:
+            close_source = infer_close_source(
+                close_usd,
+                close_is_official=close_is_official,
+                close_estimated=close_estimated,
+                close_from_last_read=close_from_last_read,
+            )
 
         window_start = parse_iso_datetime(window_start_raw)
         window_end = (
@@ -936,17 +1169,8 @@ def fetch_last_closed_rows_db(
                 "delta_estimated": delta_estimated,
                 "open_is_official": open_is_official,
                 "close_is_official": close_is_official,
-                "open_source": infer_open_source(
-                    open_usd,
-                    open_is_official=open_is_official,
-                    open_estimated=open_estimated,
-                ),
-                "close_source": infer_close_source(
-                    close_usd,
-                    close_is_official=close_is_official,
-                    close_estimated=close_estimated,
-                    close_from_last_read=close_from_last_read,
-                ),
+                "open_source": open_source,
+                "close_source": close_source,
                 "close_api": close_usd,
                 "integrity_alert": False,
                 "integrity_diff": None,
@@ -1284,6 +1508,10 @@ def fetch_closed_row_for_window_via_binance(
             "close_estimated": True,
             "close_from_last_read": False,
             "delta_estimated": True,
+            "open_is_official": False,
+            "close_is_official": False,
+            "open_source": PRICE_SOURCE_BINANCE_PROXY,
+            "close_source": PRICE_SOURCE_BINANCE_PROXY,
         }
     except Exception:
         return None
@@ -1301,6 +1529,10 @@ def fetch_closed_row_for_window_via_api(
     attempts = max(1, retries)
     variants: List[Optional[str]] = [preset.variant]
     window_start_iso = window_start.isoformat()
+    allow_binance_proxy_fallback = (
+        allow_external_price_fallback
+        and str(preset.timeframe_label).strip().lower() == "1h"
+    )
     fallback_last_read_close: Optional[float] = None
     if allow_last_read_fallback:
         fallback_last_read_close = fetch_last_live_window_read(
@@ -1309,81 +1541,127 @@ def fetch_closed_row_for_window_via_api(
     open_value: Optional[float] = None
     close_value: Optional[float] = None
     open_estimated = False
+    close_estimated = False
+    close_from_last_read = False
+    open_source = ""
+    close_source = ""
 
     for _ in range(attempts):
         for variant in variants:
             try:
-                open_raw, close_raw, _, _ = get_poly_open_close(
+                open_raw, close_raw, _, _, source = get_poly_open_close(
                     window_start,
                     window_end,
                     preset.symbol,
                     variant,
                     strict_mode=strict_official_only,
                     require_completed=strict_official_only,
+                    with_source=True,
+                    allow_binance_proxy_fallback=allow_binance_proxy_fallback,
                 )
             except Exception:
                 continue
 
             open_candidate = parse_float(open_raw)  # type: ignore[arg-type]
             close_candidate = parse_float(close_raw)  # type: ignore[arg-type]
-            if open_value is None and open_candidate is not None:
-                open_value = open_candidate
-            if close_value is None and close_candidate is not None:
-                close_value = close_candidate
-            if open_value is not None and close_value is not None:
+            candidate_source = str(source or "").strip().lower() or PRICE_SOURCE_POLYMARKET
+            candidate_is_official = source_is_official(candidate_source)
+            if strict_official_only and not candidate_is_official and not allow_binance_proxy_fallback:
+                continue
+
+            if open_candidate is not None:
+                replace_open = False
+                if open_value is None:
+                    replace_open = True
+                elif source_is_official(candidate_source) and not source_is_official(open_source):
+                    replace_open = True
+                if replace_open:
+                    open_value = open_candidate
+                    open_source = candidate_source
+                    open_estimated = not candidate_is_official
+
+            if close_candidate is not None:
+                replace_close = False
+                if close_value is None:
+                    replace_close = True
+                elif source_is_official(candidate_source) and not source_is_official(close_source):
+                    replace_close = True
+                if replace_close:
+                    close_value = close_candidate
+                    close_source = candidate_source
+                    close_estimated = not candidate_is_official
+                    close_from_last_read = False
+
+            if (
+                open_value is not None
+                and close_value is not None
+                and (
+                    (
+                        source_is_official(open_source)
+                        and source_is_official(close_source)
+                    )
+                    or allow_binance_proxy_fallback
+                )
+            ):
                 break
-        if open_value is not None and close_value is not None:
+        if (
+            open_value is not None
+            and close_value is not None
+            and (
+                (
+                    source_is_official(open_source)
+                    and source_is_official(close_source)
+                )
+                or allow_binance_proxy_fallback
+            )
+        ):
             break
 
-    close_estimated = False
-    close_from_last_read = False
     if allow_last_read_fallback and close_value is None and fallback_last_read_close is not None:
         close_value = fallback_last_read_close
         close_estimated = True
         close_from_last_read = True
-
-    if allow_external_price_fallback and (open_value is None or close_value is None):
-        external_row = fetch_closed_row_for_window_via_binance(
-            preset,
-            window_start,
-            window_end,
-        )
-        if external_row is not None:
-            external_open = parse_float(external_row.get("open"))  # type: ignore[arg-type]
-            external_close = parse_float(external_row.get("close"))  # type: ignore[arg-type]
-            if open_value is None and external_open is not None:
-                open_value = external_open
-                open_estimated = True
-            if close_value is None and external_close is not None:
-                close_value = external_close
-                close_estimated = True
-                close_from_last_read = False
+        close_source = "last_read_prev_window"
 
     if open_value is None and close_value is None:
         return None
 
     delta_value: Optional[float] = None
     delta_estimated = False
-    open_is_official = open_value is not None and not open_estimated
+    open_is_official = open_value is not None and source_is_official(open_source)
     close_is_official = (
-        close_value is not None and not close_estimated and not close_from_last_read
+        close_value is not None
+        and source_is_official(close_source)
+        and not close_from_last_read
     )
     if open_value is not None and close_value is not None:
         delta_value = close_value - open_value
         if close_estimated or open_estimated:
             delta_estimated = True
 
-    open_source = infer_open_source(
-        open_value,
-        open_is_official=open_is_official,
-        open_estimated=open_estimated,
-    )
-    close_source = infer_close_source(
-        close_value,
-        close_is_official=close_is_official,
-        close_estimated=close_estimated,
-        close_from_last_read=close_from_last_read,
-    )
+    if not open_source:
+        open_source = infer_open_source(
+            open_value,
+            open_is_official=open_is_official,
+            open_estimated=open_estimated,
+        )
+    if not close_source:
+        close_source = infer_close_source(
+            close_value,
+            close_is_official=close_is_official,
+            close_estimated=close_estimated,
+            close_from_last_read=close_from_last_read,
+        )
+    if (
+        open_source == PRICE_SOURCE_BINANCE_PROXY
+        or close_source == PRICE_SOURCE_BINANCE_PROXY
+    ):
+        print(
+            "OPEN/CLOSE usando proxy "
+            f"{preset.symbol} {preset.timeframe_label} "
+            f"{window_start.astimezone(timezone.utc).isoformat()} "
+            f"(open_source={open_source}, close_source={close_source})"
+        )
 
     row = {
         "open": open_value,
@@ -1419,8 +1697,58 @@ def should_replace_cached_row(
     candidate_open = parse_float(candidate.get("open"))  # type: ignore[arg-type]
     existing_close = parse_float(existing.get("close"))  # type: ignore[arg-type]
     candidate_close = parse_float(candidate.get("close"))  # type: ignore[arg-type]
-    existing_open_estimated = bool(existing.get("open_estimated"))
-    candidate_open_estimated = bool(candidate.get("open_estimated"))
+    existing_open_estimated = parse_boolish(existing.get("open_estimated"), default=False)
+    candidate_open_estimated = parse_boolish(candidate.get("open_estimated"), default=False)
+    existing_close_estimated = parse_boolish(existing.get("close_estimated"), default=False)
+    candidate_close_estimated = parse_boolish(candidate.get("close_estimated"), default=False)
+    existing_close_from_last_read = parse_boolish(
+        existing.get("close_from_last_read"),
+        default=False,
+    )
+    candidate_close_from_last_read = parse_boolish(
+        candidate.get("close_from_last_read"),
+        default=False,
+    )
+    existing_open_is_official = parse_boolish(
+        existing.get("open_is_official"),
+        default=(existing_open is not None and not existing_open_estimated),
+    )
+    candidate_open_is_official = parse_boolish(
+        candidate.get("open_is_official"),
+        default=(candidate_open is not None and not candidate_open_estimated),
+    )
+    existing_close_is_official = parse_boolish(
+        existing.get("close_is_official"),
+        default=(
+            existing_close is not None
+            and not existing_close_estimated
+            and not existing_close_from_last_read
+        ),
+    )
+    candidate_close_is_official = parse_boolish(
+        candidate.get("close_is_official"),
+        default=(
+            candidate_close is not None
+            and not candidate_close_estimated
+            and not candidate_close_from_last_read
+        ),
+    )
+    if existing_open_is_official and not candidate_open_is_official:
+        return False
+    if existing_close_is_official and not candidate_close_is_official:
+        return False
+    if (
+        candidate_open is not None
+        and candidate_open_is_official
+        and not existing_open_is_official
+    ):
+        return True
+    if (
+        candidate_close is not None
+        and candidate_close_is_official
+        and not existing_close_is_official
+    ):
+        return True
 
     if existing_open is None and candidate_open is not None:
         return True
@@ -1438,10 +1766,6 @@ def should_replace_cached_row(
     if existing_close is None:
         return True
 
-    existing_close_estimated = bool(existing.get("close_estimated"))
-    candidate_close_estimated = bool(candidate.get("close_estimated"))
-    existing_close_from_last_read = bool(existing.get("close_from_last_read"))
-    candidate_close_from_last_read = bool(candidate.get("close_from_last_read"))
     if existing_close_estimated and not candidate_close_estimated:
         return True
     if existing_close_from_last_read and not candidate_close_from_last_read:
@@ -1454,8 +1778,8 @@ def should_replace_cached_row(
     if existing_delta is None and candidate_delta is not None:
         return True
 
-    existing_delta_estimated = bool(existing.get("delta_estimated"))
-    candidate_delta_estimated = bool(candidate.get("delta_estimated"))
+    existing_delta_estimated = parse_boolish(existing.get("delta_estimated"), default=False)
+    candidate_delta_estimated = parse_boolish(candidate.get("delta_estimated"), default=False)
     if (
         candidate_delta is not None
         and existing_delta is not None
@@ -1543,7 +1867,12 @@ def rows_are_contiguous(older: Dict[str, object], newer: Dict[str, object]) -> b
     return older_epoch == newer_epoch
 
 
-def apply_close_integrity_corrections(rows: List[Dict[str, object]]) -> None:
+def apply_close_integrity_corrections(
+    rows: List[Dict[str, object]],
+    current_window_start: Optional[datetime] = None,
+    current_open_value: Optional[float] = None,
+    current_open_is_official: bool = False,
+) -> None:
     if not rows:
         return
 
@@ -1593,32 +1922,59 @@ def apply_close_integrity_corrections(rows: List[Dict[str, object]]) -> None:
                 close_from_last_read=close_from_last_read,
             )
 
-    for idx in range(1, len(rows)):
-        newer = rows[idx - 1]
-        older = rows[idx]
-        if not rows_are_contiguous(older, newer):
-            continue
+    next_open_value = (
+        float(current_open_value)
+        if current_open_is_official and current_open_value is not None
+        else None
+    )
+    next_open_start = (
+        current_window_start.astimezone(timezone.utc)
+        if isinstance(current_window_start, datetime) and next_open_value is not None
+        else None
+    )
 
-        next_open = parse_float(newer.get("open"))  # type: ignore[arg-type]
-        next_open_official = parse_boolish(newer.get("open_is_official"), default=False)
-        if next_open is None or not next_open_official:
-            continue
+    for row in rows:
+        row_end = row.get("window_end")
+        can_apply_bridge = (
+            next_open_value is not None
+            and next_open_start is not None
+            and isinstance(row_end, datetime)
+            and int(row_end.astimezone(timezone.utc).timestamp())
+            == int(next_open_start.timestamp())
+        )
 
-        close_api = parse_float(older.get("close_api"))  # type: ignore[arg-type]
-        older["close"] = next_open
-        older["close_source"] = "next_open_official"
-        older["close_estimated"] = False
-        older["close_from_last_read"] = False
-        older["close_is_official"] = True
-        older["integrity_next_open_official"] = next_open
+        if can_apply_bridge:
+            close_api = parse_float(row.get("close_api"))  # type: ignore[arg-type]
+            row["close"] = next_open_value
+            row["close_source"] = "next_open_official"
+            row["close_estimated"] = False
+            row["close_from_last_read"] = False
+            row["close_is_official"] = True
+            row["integrity_next_open_official"] = next_open_value
 
-        if close_api is not None:
-            diff = abs(close_api - next_open)
-            older["integrity_diff"] = diff
-            older["integrity_alert"] = diff > INTEGRITY_CLOSE_DIFF_THRESHOLD
+            if close_api is not None:
+                diff = abs(close_api - next_open_value)
+                row["integrity_diff"] = diff
+                row["integrity_alert"] = diff > INTEGRITY_CLOSE_DIFF_THRESHOLD
+            else:
+                row["integrity_diff"] = None
+                row["integrity_alert"] = False
         else:
-            older["integrity_diff"] = None
-            older["integrity_alert"] = False
+            next_open_value = None
+            next_open_start = None
+
+        open_value = parse_float(row.get("open"))  # type: ignore[arg-type]
+        open_is_official = parse_boolish(
+            row.get("open_is_official"),
+            default=(open_value is not None and not parse_boolish(row.get("open_estimated"), default=False)),
+        )
+        row_start = row.get("window_start")
+        if open_value is not None and open_is_official and isinstance(row_start, datetime):
+            next_open_value = open_value
+            next_open_start = row_start.astimezone(timezone.utc)
+        else:
+            next_open_value = None
+            next_open_start = None
 
     for row in rows:
         open_value = parse_float(row.get("open"))  # type: ignore[arg-type]
@@ -1638,6 +1994,8 @@ def fetch_status_history_rows(
     current_window_start: datetime,
     history_count: int,
     api_window_retries: int,
+    current_open_value: Optional[float] = None,
+    current_open_is_official: bool = False,
 ) -> List[Dict[str, object]]:
     if history_count <= 0:
         return []
@@ -1648,6 +2006,12 @@ def fetch_status_history_rows(
         base_retries * STATUS_CRITICAL_RETRY_MULTIPLIER,
         STATUS_CRITICAL_MIN_RETRIES,
     )
+    use_proxy_fallback = str(preset.timeframe_label).strip().lower() == "1h"
+    if use_proxy_fallback:
+        # Keep /eth1h and /btc1h responsive when upstream is rate-limited.
+        # Proxy fallback is source-aware and can be promoted later to official.
+        base_retries = min(base_retries, 2)
+        critical_retries = min(critical_retries, 2)
 
     expected_starts = [
         current_window_start - timedelta(seconds=preset.window_seconds * offset)
@@ -1679,18 +2043,56 @@ def fetch_status_history_rows(
         row_retries = critical_retries if idx < critical_window_count else base_retries
 
         source_row = db_by_epoch.get(start_epoch)
-        if source_row is None:
-            source_row = fetch_closed_row_for_window_via_api(
+        source_row_needs_retry = source_row is None or row_is_provisional(source_row)
+        if source_row_needs_retry:
+            api_row = fetch_closed_row_for_window_via_api(
                 preset,
                 start_dt,
                 end_dt,
                 retries=row_retries,
                 allow_last_read_fallback=False,
-                allow_external_price_fallback=False,
+                allow_external_price_fallback=use_proxy_fallback,
                 strict_official_only=True,
             )
+            if api_row is not None and (
+                source_row is None or should_replace_cached_row(source_row, api_row)
+            ):
+                if source_row is not None and row_is_provisional(source_row) and not row_is_provisional(api_row):
+                    print(
+                        "Reconciliacion OPEN/CLOSE "
+                        f"{preset.symbol} {preset.timeframe_label} {start_dt.isoformat()} "
+                        "proxy->official"
+                    )
+                source_row = api_row
         if source_row is None:
             source_row = cached_rows.get(start_epoch)
+        if source_row is None:
+            last_read_close = fetch_last_live_window_read(
+                preset.db_path,
+                preset.series_slug,
+                start_dt.isoformat(),
+            )
+            if last_read_close is not None:
+                source_row = {
+                    "open": None,
+                    "close": last_read_close,
+                    "delta": None,
+                    "window_start": start_dt,
+                    "window_end": end_dt,
+                    "open_estimated": False,
+                    "close_estimated": True,
+                    "close_from_last_read": True,
+                    "delta_estimated": True,
+                    "open_is_official": False,
+                    "close_is_official": False,
+                    "open_source": "open_missing",
+                    "close_source": "last_read_prev_window",
+                    "close_api": None,
+                    "integrity_alert": False,
+                    "integrity_diff": None,
+                    "integrity_next_open_official": None,
+                    "direction": None,
+                }
 
         if source_row is None:
             normalized = {
@@ -1720,34 +2122,75 @@ def fetch_status_history_rows(
         output_rows.append(normalized)
 
     backfill_history_rows(output_rows)
-    apply_close_integrity_corrections(output_rows)
+    apply_close_integrity_corrections(
+        output_rows,
+        current_window_start=current_window_start,
+        current_open_value=current_open_value,
+        current_open_is_official=current_open_is_official,
+    )
 
-    # Preserve strict contiguous sequence. If a window is still missing,
-    # retry only that exact window instead of replacing it with older rows.
-    missing_indexes = [
+    # Preserve strict contiguous sequence. Retry exact windows that remain
+    # without close value; provisional rows are retried on next command cycle.
+    retry_indexes = [
         idx
         for idx, row in enumerate(output_rows)
         if parse_float(row.get("close")) is None  # type: ignore[arg-type]
     ]
-    if missing_indexes:
-        for idx in missing_indexes:
+    if retry_indexes:
+        for idx in retry_indexes:
             start_dt = expected_starts[idx]
             end_dt = start_dt + timedelta(seconds=preset.window_seconds)
             start_epoch = int(start_dt.timestamp())
             row_retries = critical_retries if idx < critical_window_count else base_retries
             source_row = db_by_epoch.get(start_epoch)
-            if source_row is None:
-                source_row = fetch_closed_row_for_window_via_api(
-                    preset,
-                    start_dt,
-                    end_dt,
-                    retries=max(row_retries, base_retries + 2),
-                    allow_last_read_fallback=False,
-                    allow_external_price_fallback=False,
-                    strict_official_only=True,
-                )
+            api_row = fetch_closed_row_for_window_via_api(
+                preset,
+                start_dt,
+                end_dt,
+                retries=max(row_retries, base_retries + 2),
+                allow_last_read_fallback=False,
+                allow_external_price_fallback=use_proxy_fallback,
+                strict_official_only=True,
+            )
+            if api_row is not None and (
+                source_row is None or should_replace_cached_row(source_row, api_row)
+            ):
+                if source_row is not None and row_is_provisional(source_row) and not row_is_provisional(api_row):
+                    print(
+                        "Reconciliacion OPEN/CLOSE "
+                        f"{preset.symbol} {preset.timeframe_label} {start_dt.isoformat()} "
+                        "proxy->official"
+                    )
+                source_row = api_row
             if source_row is None:
                 source_row = cached_rows.get(start_epoch)
+            if source_row is None:
+                last_read_close = fetch_last_live_window_read(
+                    preset.db_path,
+                    preset.series_slug,
+                    start_dt.isoformat(),
+                )
+                if last_read_close is not None:
+                    source_row = {
+                        "open": None,
+                        "close": last_read_close,
+                        "delta": None,
+                        "window_start": start_dt,
+                        "window_end": end_dt,
+                        "open_estimated": False,
+                        "close_estimated": True,
+                        "close_from_last_read": True,
+                        "delta_estimated": True,
+                        "open_is_official": False,
+                        "close_is_official": False,
+                        "open_source": "open_missing",
+                        "close_source": "last_read_prev_window",
+                        "close_api": None,
+                        "integrity_alert": False,
+                        "integrity_diff": None,
+                        "integrity_next_open_official": None,
+                        "direction": None,
+                    }
             if source_row is None:
                 continue
             output_rows[idx] = normalize_history_row(
@@ -1756,7 +2199,12 @@ def fetch_status_history_rows(
                 preset.window_seconds,
             )
         backfill_history_rows(output_rows)
-        apply_close_integrity_corrections(output_rows)
+        apply_close_integrity_corrections(
+            output_rows,
+            current_window_start=current_window_start,
+            current_open_value=current_open_value,
+            current_open_is_official=current_open_is_official,
+        )
 
     for row in output_rows:
         start_epoch = window_epoch(row.get("window_start"))  # type: ignore[arg-type]
@@ -1802,6 +2250,7 @@ def build_status_message(
     live_window_start: datetime,
     live_window_end: datetime,
     live_price: Optional[float],
+    live_source: str,
     open_price: Optional[float],
     history_rows: List[Dict[str, object]],
     detailed: bool = False,
@@ -1822,11 +2271,12 @@ def build_status_message(
         else:
             lines.append("Precio actual: No disponible")
     else:
+        live_label = format_live_price_label(live_price, live_source)
         if open_price is None:
-            lines.append(f"Precio actual: {fmt_usd(live_price)} (sin base)")
+            lines.append(f"Precio actual: {live_label} (sin base)")
         else:
             delta = live_price - open_price
-            lines.append(f"Precio actual: {fmt_usd(live_price)} {format_delta_with_emoji(delta)}")
+            lines.append(f"Precio actual: {live_label} {format_delta_with_emoji(delta)}")
 
     corrected_sessions = 0
     max_integrity_diff: Optional[float] = None
@@ -1842,6 +2292,10 @@ def build_status_message(
         close_estimated = bool(row.get("close_estimated"))
         close_from_last_read = bool(row.get("close_from_last_read"))
         delta_estimated = bool(row.get("delta_estimated"))
+        close_is_official = parse_boolish(
+            row.get("close_is_official"),
+            default=(close_usd is not None and not close_estimated and not close_from_last_read),
+        )
         open_source = str(row.get("open_source") or "open_unknown")
         close_source = str(row.get("close_source") or "close_unknown")
         integrity_alert = bool(row.get("integrity_alert"))
@@ -1857,25 +2311,26 @@ def build_status_message(
             status_suffix = " (ultima lectura)"
         elif is_estimated:
             status_suffix = " (estimado)"
+        close_label = format_price_with_source_suffix(close_usd, is_official=close_is_official)
         if close_usd is None:
             if detailed:
-                lines.append(f"{prefix}: No disponible [{trace}]")
+                lines.append(f"{prefix}: No encontrado [{trace}]")
             else:
-                lines.append(f"{prefix}: No disponible")
+                lines.append(f"{prefix}: No encontrado")
         elif delta is None:
             suffix = status_suffix if status_suffix else " (sin delta)"
             if detailed:
-                lines.append(f"{prefix}: {fmt_usd(close_usd)}{suffix} [{trace}]")
+                lines.append(f"{prefix}: {close_label}{suffix} [{trace}]")
             else:
-                lines.append(f"{prefix}: {fmt_usd(close_usd)}{suffix}")
+                lines.append(f"{prefix}: {close_label}{suffix}")
         else:
             delta_label = format_delta_with_emoji(delta)
             if status_suffix:
                 delta_label = f"{delta_label}{status_suffix}"
             if detailed:
-                lines.append(f"{prefix}: {fmt_usd(close_usd)} {delta_label} [{trace}]")
+                lines.append(f"{prefix}: {close_label} {delta_label} [{trace}]")
             else:
-                lines.append(f"{prefix}: {fmt_usd(close_usd)} {delta_label}")
+                lines.append(f"{prefix}: {close_label} {delta_label}")
 
         if integrity_alert:
             corrected_sessions += 1
@@ -2579,6 +3034,28 @@ def clear_inline_keyboard(
         return False
 
 
+def delete_telegram_message(
+    token: str,
+    chat_id: str,
+    message_id: int,
+) -> bool:
+    url = f"https://api.telegram.org/bot{token}/deleteMessage"
+    payload: Dict[str, object] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+    try:
+        resp = HTTP.post(url, data=payload, timeout=10)
+        if resp.status_code >= 400:
+            # Message may be too old or not deletable (permissions/history).
+            print(f"Telegram delete message error {resp.status_code}: {resp.text[:200]}")
+            return False
+        return True
+    except Exception as exc:
+        print(f"Telegram delete message error: {exc}")
+        return False
+
+
 def build_message(template: str, data: Dict[str, object]) -> str:
     try:
         return template.format(**data)
@@ -2597,26 +3074,31 @@ def resolve_open_price(
 ) -> Tuple[Optional[float], Optional[str]]:
     attempts = max(1, retries)
     close_candidate: Optional[float] = None
+    close_candidate_source: Optional[str] = None
     prev_window_start_iso = (
         w_start - timedelta(seconds=preset.window_seconds)
     ).astimezone(timezone.utc).isoformat()
     for _ in range(attempts):
         try:
-            open_raw, close_raw, _, _ = get_poly_open_close(
+            open_raw, close_raw, _, _, fetch_source = get_poly_open_close(
                 w_start,
                 w_end,
                 preset.symbol,
                 preset.variant,
                 strict_mode=True,
+                with_source=True,
             )
         except Exception:
             continue
         open_real = parse_float(open_raw)  # type: ignore[arg-type]
         close_real = parse_float(close_raw)  # type: ignore[arg-type]
         if open_real is not None:
-            return open_real, "OPEN"
+            if source_is_official(fetch_source):
+                return open_real, "OPEN"
+            return open_real, "OPEN_PROXY"
         if close_candidate is None and close_real is not None:
             close_candidate = close_real
+            close_candidate_source = fetch_source
 
     prev_close = fetch_close_for_window(
         preset.db_path,
@@ -2640,7 +3122,9 @@ def resolve_open_price(
 
     if close_candidate is not None:
         # Last resort when OPEN/PREV_CLOSE are unavailable.
-        return close_candidate, "CLOSE"
+        if source_is_official(close_candidate_source):
+            return close_candidate, "CLOSE"
+        return close_candidate, "CLOSE_PROXY"
 
     return None, None
 
@@ -2673,6 +3157,20 @@ def get_live_price_with_fallback(
     now_utc: datetime,
     max_live_price_age_seconds: int,
 ) -> Tuple[Optional[float], Optional[datetime], str]:
+    def fallback_live_binance_proxy() -> Tuple[Optional[float], Optional[datetime], str]:
+        if str(preset.timeframe_label).strip().lower() != "1h":
+            return None, None, "NONE"
+        row = fetch_closed_row_for_window_via_binance(preset, w_start, w_end)
+        if row is None:
+            return None, None, "NONE"
+        close_value = parse_float(row.get("close"))  # type: ignore[arg-type]
+        if close_value is not None:
+            return close_value, None, "BINANCE_CLOSE"
+        open_value = parse_float(row.get("open"))  # type: ignore[arg-type]
+        if open_value is not None:
+            return open_value, None, "BINANCE_OPEN"
+        return None, None, "NONE"
+
     live_price, live_ts = get_fresh_rtds_price(
         preset, prices, now_utc, max_live_price_age_seconds
     )
@@ -2681,22 +3179,51 @@ def get_live_price_with_fallback(
 
     # Fallback a API (close/open de la ventana actual)
     try:
-        open_real, close_real, _, _ = get_poly_open_close(
+        open_real, close_real, _, _, source = get_poly_open_close(
             w_start,
             w_end,
             preset.symbol,
             preset.variant,
             strict_mode=True,
+            with_source=True,
+            allow_binance_proxy_fallback=(
+                str(preset.timeframe_label).strip().lower() == "1h"
+            ),
         )
     except Exception:
+        proxy_price, proxy_ts, proxy_source = fallback_live_binance_proxy()
+        if proxy_price is not None:
+            print(
+                "Precio live via Binance proxy "
+                f"{preset.symbol} {preset.timeframe_label} "
+                f"{w_start.astimezone(timezone.utc).isoformat()}"
+            )
+            return proxy_price, proxy_ts, proxy_source
         return None, None, "NONE"
 
+    is_proxy = not source_is_official(source)
     close_value = parse_float(close_real)  # type: ignore[arg-type]
     open_value = parse_float(open_real)  # type: ignore[arg-type]
     if close_value is not None:
+        if is_proxy:
+            if str(source or "").strip().lower() == PRICE_SOURCE_BINANCE_PROXY:
+                return close_value, None, "BINANCE_CLOSE"
+            return close_value, None, "API_CLOSE_PROXY"
         return close_value, None, "API_CLOSE"
     if open_value is not None:
+        if is_proxy:
+            if str(source or "").strip().lower() == PRICE_SOURCE_BINANCE_PROXY:
+                return open_value, None, "BINANCE_OPEN"
+            return open_value, None, "API_OPEN_PROXY"
         return open_value, None, "API_OPEN"
+    proxy_price, proxy_ts, proxy_source = fallback_live_binance_proxy()
+    if proxy_price is not None:
+        print(
+            "Precio live via Binance proxy "
+            f"{preset.symbol} {preset.timeframe_label} "
+            f"{w_start.astimezone(timezone.utc).isoformat()}"
+        )
+        return proxy_price, proxy_ts, proxy_source
     return None, None, "NONE"
 
 

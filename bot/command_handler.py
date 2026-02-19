@@ -18,6 +18,7 @@ from bot.live_trading import (
     save_live_trades_state,
 )
 from bot.preview_controls import (
+    PREVIEW_CANCEL_CODE,
     DEFAULT_PREVIEW_TARGET_CODE,
     MANUAL_PREVIEW_MARKET_COMMANDS,
     PREVIEW_TARGET_OPTIONS,
@@ -165,10 +166,46 @@ async def command_loop(
                                 str(callback_id),
                                 text="Preview expirada o ya utilizada.",
                                 show_alert=False,
-                            )
+                        )
                         continue
 
                     callback_message_id = parse_int(str(callback_message.get("message_id")))
+                    if target_code == PREVIEW_CANCEL_CODE:
+                        deleted_preview_message = False
+                        if callback_chat_id is not None and callback_message_id is not None:
+                            deleted_preview_message = delete_telegram_message(
+                                token,
+                                str(callback_chat_id),
+                                callback_message_id,
+                            )
+                            if not deleted_preview_message:
+                                clear_inline_keyboard(
+                                    token,
+                                    str(callback_chat_id),
+                                    callback_message_id,
+                                )
+
+                        if callback_id:
+                            answer_callback_query(
+                                token,
+                                str(callback_id),
+                                text="Operacion cancelada.",
+                                show_alert=False,
+                            )
+
+                        if callback_chat_id is not None and not deleted_preview_message:
+                            selected_user = build_callback_user_label(callback_query)
+                            send_telegram(
+                                token,
+                                str(callback_chat_id),
+                                (
+                                    "<b>Operacion cancelada</b>\n"
+                                    f"Solicitud cancelada por {escape_html_text(selected_user)}."
+                                ),
+                                parse_mode=parse_mode,
+                            )
+                        continue
+
                     if callback_chat_id is not None and callback_message_id is not None:
                         clear_inline_keyboard(
                             token,
@@ -384,8 +421,8 @@ async def command_loop(
                     now,
                     max_live_price_age_seconds,
                 )
-                # Estado /reportes: solo aceptar feed RTDS fresco como "Precio actual".
-                if live_source != "RTDS" or live_ts is None:
+                # Preferimos RTDS fresco; si no hay, permitimos fallback y lo marcamos como proxy.
+                if live_source == "RTDS" and live_ts is None:
                     live_price = None
 
                 history_rows = fetch_status_history_rows(
@@ -393,6 +430,8 @@ async def command_loop(
                     w_start,
                     status_history_override or history_count,
                     api_window_retries=status_api_window_retries,
+                    current_open_value=open_price,
+                    current_open_is_official=(open_source == "OPEN"),
                 )
 
                 response = build_status_message(
@@ -400,6 +439,7 @@ async def command_loop(
                     w_start,
                     w_end,
                     live_price,
+                    live_source,
                     open_price,
                     history_rows,
                     detailed=status_detailed,
