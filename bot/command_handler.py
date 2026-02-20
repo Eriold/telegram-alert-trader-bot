@@ -4,7 +4,8 @@ import asyncio
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
-from bot.command_processors import CommandRuntime, process_update
+from bot.command_processors import process_update
+from bot.command_runtime import CommandRuntime
 from bot.core_utils import (
     DEFAULT_MAX_LIVE_PRICE_AGE_SECONDS,
     DEFAULT_MAX_PATTERN_STREAK,
