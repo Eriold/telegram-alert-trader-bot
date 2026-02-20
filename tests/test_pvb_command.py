@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from bot.core_utils import (
+from bot.status_commands import (
     build_pvb_comparison_rows,
     build_pvb_status_message,
     resolve_pvb_command,
@@ -52,7 +52,7 @@ class PvbCommandTest(unittest.TestCase):
         ]
 
         with patch(
-            "bot.core_utils.fetch_closed_row_for_window_via_binance",
+            "bot.status_commands.fetch_closed_row_for_window_via_binance",
             return_value={"open": 99.0, "close": 99.5},
         ):
             comparison = build_pvb_comparison_rows(self.preset, rows)

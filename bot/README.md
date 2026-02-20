@@ -8,7 +8,8 @@ Este directorio concentra la logica compartida del bot para reducir el tamano de
 - `live_trading.py`: inicializacion de cliente CLOB, ejecucion de ordenes, reintentos de salida limit y monitoreo de cierres.
 - `command_handler.py`: loop de comandos de Telegram (`/eth15m`, `/preview-*`, `/current-*`, callbacks).
 - `alert_service.py`: loop principal de alertas y orquestacion de tareas async.
-- `core_utils.py`: utilidades compartidas (env/config, DB/history, Gamma/Binance, RTDS, Telegram HTTP, formato).
+- `status_commands.py`: parseo y construccion de respuestas para comandos de estado (`/eth*`, `/btc*`, `/...D`, `/pvb*`).
+- `core_utils.py`: utilidades compartidas de bajo nivel (env/config, DB/history, Gamma/Binance, RTDS, Telegram HTTP, helpers).
 
 ## Entry point
 

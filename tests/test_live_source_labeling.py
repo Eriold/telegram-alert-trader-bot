@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from bot.core_utils import build_status_message
+from bot.status_commands import build_status_message
 from common.monitor_presets import MonitorPreset
 
 
