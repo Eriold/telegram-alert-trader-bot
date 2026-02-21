@@ -2,11 +2,42 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 from bot.alert_cycle import AlertTickContext, process_alert_tick
 
 from bot.command_handler import command_loop
-from bot.core_utils import *
+from bot.core_utils import (
+    DEFAULT_ALERT_TEMPLATE,
+    DEFAULT_MAX_LIVE_PRICE_AGE_SECONDS,
+    DEFAULT_MAX_PATTERN_STREAK,
+    DEFAULT_OPERATION_PATTERN_TRIGGER,
+    DEFAULT_OPERATION_PREVIEW_SHARES,
+    DEFAULT_OPERATION_PREVIEW_TARGET_PROFIT_PCT,
+    DEFAULT_PREVIEW_TEMPLATE,
+    DEFAULT_STATUS_API_WINDOW_RETRIES,
+    ENV_PATH,
+    MIN_PATTERN_TO_ALERT,
+    PREVIEW_TEMPLATE_PATH,
+    STATE_PATH,
+    TARGETS,
+    TEMPLATE_PATH,
+    MonitorPreset,
+    WindowState,
+    build_thresholds,
+    configure_proxy,
+    load_env,
+    load_state,
+    load_template,
+    norm_symbol,
+    parse_bool,
+    parse_chat_ids,
+    parse_float,
+    parse_int,
+    rtds_price_loop,
+    send_telegram,
+)
 from bot.live_trading import (
     DEFAULT_ENTRY_TOKEN_RESOLVE_POLL_SECONDS,
     DEFAULT_ENTRY_TOKEN_RESOLVE_WAIT_SECONDS,
@@ -19,6 +50,7 @@ from bot.live_trading import (
     load_live_trades_state,
     live_exit_monitor_loop,
 )
+from common.monitor_presets import get_preset
 from bot.preview_controls import (
     build_wallet_history_url,
     normalize_trading_mode,

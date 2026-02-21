@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import os
 import time
+from typing import Dict, Optional, Tuple
 
-from bot.core_utils import *
+from bot.core_utils import parse_float
 from bot.live_trading_constants import (
     DEFAULT_ENTRY_ORDER_WAIT_SECONDS,
     DEFAULT_EXIT_LIMIT_MAX_RETRIES,

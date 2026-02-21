@@ -23,6 +23,11 @@ Este directorio concentra la logica compartida del bot para reducir el tamano de
 - `status_commands.py`: parseo y construccion de respuestas para comandos de estado (`/eth*`, `/btc*`, `/...D`, `/pvb*`).
 - `history_status.py`: pipeline de historial de estado (backfill, integridad OPEN/CLOSE y secuencia contigua).
 - `telegram_io.py`: cliente HTTP de Telegram (`sendMessage`, callbacks, delete/edit markup, `getUpdates`).
+- `core_env_io.py`: carga de `.env`, estado y configuracion de proxy/thresholds.
+- `core_formatting.py`: parseo/formato compartido (`parse_*`, `format_*`, comandos, placeholders).
+- `core_db_io.py`: persistencia/lectura SQLite (candles, live reads, streak DB e integridad de oficial/proxy).
+- `core_market_data.py`: resolucion de precios/ventanas (Polymarket/Binance/RTDS) y utilidades de filas API.
+- `core_market_helpers.py`: helpers de Gamma/slug y conversion de horario ET.
 - `core_utils.py`: utilidades compartidas de bajo nivel (env/config, DB/history, Gamma/Binance, RTDS, Telegram HTTP, helpers).
 
 ## Entry point

@@ -4,7 +4,15 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
-from bot.core_utils import *
+from bot.core_utils import (
+    GAMMA_BASE,
+    HTTP,
+    build_hourly_up_or_down_slug,
+    parse_float,
+    parse_gamma_up_down_prices,
+    parse_gamma_up_down_token_ids,
+    parse_int,
+)
 
 
 def fetch_market_snapshot_by_slug(slug: str) -> Optional[Dict[str, object]]:
