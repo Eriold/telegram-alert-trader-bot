@@ -29,6 +29,7 @@ def fetch_recent_directions_via_api(
     current_open_is_official: bool = False,
     limit: int = 3,
     retries_per_window: int = 1,
+    allow_estimated_rows: bool = False,
     audit: Optional[List[str]] = None,
     poly_open_close_fn: Callable[..., Tuple[object, object, object, object, object]] = get_poly_open_close,
 ) -> List[str]:
@@ -48,8 +49,8 @@ def fetch_recent_directions_via_api(
             w_end,
             retries=max(1, retries_per_window),
             allow_last_read_fallback=False,
-            allow_external_price_fallback=False,
-            strict_official_only=True,
+            allow_external_price_fallback=allow_estimated_rows,
+            strict_official_only=not allow_estimated_rows,
             poly_open_close_fn=poly_open_close_fn,
         )
         if row is None:
@@ -58,10 +59,13 @@ def fetch_recent_directions_via_api(
             break
 
         if (
-            bool(row.get("open_estimated"))
-            or bool(row.get("close_estimated"))
-            or bool(row.get("delta_estimated"))
-            or bool(row.get("close_from_last_read"))
+            not allow_estimated_rows
+            and (
+                bool(row.get("open_estimated"))
+                or bool(row.get("close_estimated"))
+                or bool(row.get("delta_estimated"))
+                or bool(row.get("close_from_last_read"))
+            )
         ):
             if audit is not None:
                 audit.append(f"api_estimated_window_offset={offset}")

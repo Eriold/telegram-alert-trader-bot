@@ -429,6 +429,7 @@ def fetch_last_closed_directions_excluding_current(
     current_open_value: Optional[float] = None,
     current_open_is_official: bool = False,
     limit: int = 3,
+    include_estimated_rows: bool = False,
     audit: Optional[List[str]] = None,
 ) -> List[str]:
     return db_fetch_last_closed_directions_excluding_current(
@@ -439,6 +440,7 @@ def fetch_last_closed_directions_excluding_current(
         current_open_value=current_open_value,
         current_open_is_official=current_open_is_official,
         limit=limit,
+        include_estimated_rows=include_estimated_rows,
         audit=audit,
     )
 
@@ -470,6 +472,7 @@ def fetch_recent_directions_via_api(
     current_open_is_official: bool = False,
     limit: int = 3,
     retries_per_window: int = 1,
+    allow_estimated_rows: bool = False,
     audit: Optional[List[str]] = None,
 ) -> List[str]:
     return market_fetch_recent_directions_via_api(
@@ -479,6 +482,7 @@ def fetch_recent_directions_via_api(
         current_open_is_official=current_open_is_official,
         limit=limit,
         retries_per_window=retries_per_window,
+        allow_estimated_rows=allow_estimated_rows,
         audit=audit,
         poly_open_close_fn=get_poly_open_close,
     )

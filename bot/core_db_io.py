@@ -480,6 +480,7 @@ def fetch_last_closed_directions_excluding_current(
     current_open_value: Optional[float] = None,
     current_open_is_official: bool = False,
     limit: int = 3,
+    include_estimated_rows: bool = False,
     audit: Optional[List[str]] = None,
 ) -> List[str]:
     if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
@@ -515,12 +516,15 @@ def fetch_last_closed_directions_excluding_current(
             else f"CASE WHEN {open_estimated_expr} = 0 THEN 1 ELSE 0 END"
         )
         estimated_filter = ""
-        if {
-            "open_estimated",
-            "close_estimated",
-            "close_from_last_read",
-            "delta_estimated",
-        }.issubset(columns):
+        if (
+            not include_estimated_rows
+            and {
+                "open_estimated",
+                "close_estimated",
+                "close_from_last_read",
+                "delta_estimated",
+            }.issubset(columns)
+        ):
             estimated_filter = (
                 " AND COALESCE(open_estimated, 0) = 0"
                 " AND COALESCE(close_estimated, 0) = 0"

@@ -279,7 +279,11 @@ async def process_alert_tick(ctx: AlertTickContext, now: datetime) -> None:
         )
         if skip_alert_preview and not auto_live_enabled:
             continue
-    
+
+        allow_estimated_streak = (
+            str(preset.timeframe_label).strip().lower() == "1h"
+        )
+
         # Last closed directions to determine dynamic streak (UPn / DOWNn)
         db_audit: List[str] = []
         directions = fetch_last_closed_directions_excluding_current(
@@ -290,6 +294,7 @@ async def process_alert_tick(ctx: AlertTickContext, now: datetime) -> None:
             current_open_value=w_state.open_price,
             current_open_is_official=(w_state.open_source == "OPEN"),
             limit=max_pattern_streak,
+            include_estimated_rows=allow_estimated_streak,
             audit=db_audit,
         )
         direction_source = "DB"
@@ -307,6 +312,7 @@ async def process_alert_tick(ctx: AlertTickContext, now: datetime) -> None:
                 current_open_is_official=(w_state.open_source == "OPEN"),
                 limit=max_pattern_streak,
                 retries_per_window=status_api_window_retries,
+                allow_estimated_rows=allow_estimated_streak,
                 audit=api_audit,
             )
             if len(api_directions) > len(directions) and api_directions:

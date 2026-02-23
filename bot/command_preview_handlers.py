@@ -37,6 +37,9 @@ def _resolve_streak_directions(
     max_pattern_streak: int,
     status_api_window_retries: int,
 ) -> List[str]:
+    allow_estimated_streak = (
+        str(preset.timeframe_label).strip().lower() == "1h"
+    )
     directions = fetch_last_closed_directions_excluding_current(
         preset.db_path,
         preset.series_slug,
@@ -45,6 +48,7 @@ def _resolve_streak_directions(
         current_open_value=open_price,
         current_open_is_official=(open_source == "OPEN"),
         limit=max_pattern_streak,
+        include_estimated_rows=allow_estimated_streak,
         audit=[],
     )
     if len(directions) < max_pattern_streak:
@@ -55,6 +59,7 @@ def _resolve_streak_directions(
             current_open_is_official=(open_source == "OPEN"),
             limit=max_pattern_streak,
             retries_per_window=status_api_window_retries,
+            allow_estimated_rows=allow_estimated_streak,
             audit=[],
         )
         if len(api_directions) > len(directions) and api_directions:
